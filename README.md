@@ -592,4 +592,3 @@ For a model with E experts and top-K routing, `active ≈ total - (E - K) × par
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
-```
