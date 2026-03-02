@@ -12,8 +12,6 @@ Developed independently by [Francisco Antonio](https://github.com/MeryylleA) —
 
 </div>
 
----
-
 ## What Is This?
 
 Lunaris MoC is a Transformer language model architecture where multiple experts **collaborate before producing output**, and the model **learns how much computation each token needs**.
@@ -24,6 +22,22 @@ This repository contains two files:
 
 - `model_moc.py` — the complete model architecture
 - `train_moc.py` — the training script (single-GPU, bf16, full diagnostics)
+
+---
+
+## 📊 Initial Experiments & Performance
+
+Early ablation studies and training runs demonstrate that the **MoC architecture consistently outperforms** both dense baselines (Vanilla) and standard Mixture-of-Experts (MoE) across key metrics. The charts below compare the validation and training trajectories over the first 200 steps.
+
+<div align="center">
+  <img src="assets/val_loss.png" width="48%" alt="Validation Loss Comparison" />
+  <img src="assets/val_perplexity.png" width="48%" alt="Validation Perplexity Comparison" />
+</div>
+<br>
+<div align="center">
+  <img src="assets/train_loss_ce.png" width="48%" alt="Cross Entropy Loss" />
+  <img src="assets/train_loss_total.png" width="48%" alt="Total Training Loss" />
+</div>
 
 ---
 
