@@ -766,8 +766,8 @@ class MoCTopKExperts(nn.Module):
 
             # This loop is intentionally kept: each expert has distinct parameters.
             for e in range(self.n_experts):
-                s = int(starts[e].item())
-                t = int(ends[e].item())
+                s = int(starts[e].tolist())
+                t = int(ends[e].tolist())
                 chunk_size = t - s
                 if chunk_size == 0:
                     continue
@@ -1184,7 +1184,7 @@ if __name__ == "__main__":
     model.train()
     logits, loss_tuple, _, debug = model(idx, targets=targets)
     total_loss, ce_loss, aux_loss = loss_tuple
-    print(f"Losses -> total: {total_loss.item():.4f}, ce: {ce_loss.item():.4f}, aux: {aux_loss.item():.6f}")
+    print(f"Losses -> total: {total_loss.tolist():.4f}, ce: {ce_loss.tolist():.4f}, aux: {aux_loss.tolist():.6f}")
     print("Debug keys:", None if debug is None else list(debug.keys()))
     assert logits.shape == (bsz, seqlen, cfg.vocab_size)
 
