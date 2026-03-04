@@ -341,6 +341,9 @@ class ReasoningFeedForward(nn.Module):
 
         if self.adaptive_reasoning:
             self.step_gate = nn.Linear(config.d_model, self.max_reasoning_steps + 1, bias=True)
+            with torch.no_grad():
+                self.step_gate.bias.zero_()
+                self.step_gate.bias.data[-1] = 2.0
         else:
             self.step_gate = None
 
@@ -458,6 +461,7 @@ class MoCTopKExperts(nn.Module):
         self.use_simple_collab = bool(getattr(config, "use_simple_collab", False))
         self.use_moc_collab = bool(getattr(config, "use_moc_collab", True))
         self.max_collab_steps = max(0, int(getattr(config, "moc_collab_steps", 0)))
+        self.collab_alpha = 1.0 / math.sqrt(float(max(1, self.max_collab_steps)))
         self.adaptive_collaboration = bool(getattr(config, "adaptive_collaboration", True)) and self.max_collab_steps > 1
         self.adaptive_mode = str(getattr(config, "adaptive_compute_mode", "soft")).lower()
         self.collab_gate_temperature = float(getattr(config, "collaboration_gate_temperature", 1.0))
@@ -497,6 +501,8 @@ class MoCTopKExperts(nn.Module):
 
         self.med_context = nn.Linear(d_model, d_model, bias=False)
         self.fuse_gate = nn.Linear(d_model, 1, bias=True)
+        with torch.no_grad():
+            self.fuse_gate.bias.fill_(-2.0)
 
         if self.moc_expert_feedback:
             self.med_to_exp = nn.Linear(d_model, d_model, bias=False)
@@ -505,6 +511,9 @@ class MoCTopKExperts(nn.Module):
 
         if self.adaptive_collaboration:
             self.collab_step_gate = nn.Linear(d_model, self.max_collab_steps + 1, bias=True)
+            with torch.no_grad():
+                self.collab_step_gate.bias.zero_()
+                self.collab_step_gate.bias.data[-1] = 2.0
         else:
             self.collab_step_gate = None
 
@@ -612,14 +621,17 @@ class MoCTopKExperts(nn.Module):
 
         msg = torch.sum(attn.to(v.dtype).unsqueeze(-1) * v, dim=1)
         med_delta = self.med_mlp(m_norm + msg)
-        mediator_new = mediator + self.collab_dropout(med_delta)
+        mediator_new = mediator + self.collab_alpha * self.collab_dropout(med_delta)
 
         experts_new = expert_states
         if self.moc_expert_feedback:
             med_msg = self.med_to_exp(self.mediator_norm(mediator_new)).unsqueeze(1)
-            gate = torch.sigmoid(self.exp_feedback_e(expert_states) + self.exp_feedback_m(mediator_new).unsqueeze(1))
+            gate = torch.sigmoid(
+                self.exp_feedback_e(self.expert_norm(expert_states))
+                + self.exp_feedback_m(self.mediator_norm(mediator_new)).unsqueeze(1)
+            )
             exp_delta = gate * med_msg
-            experts_new = expert_states + self.collab_dropout(exp_delta)
+            experts_new = expert_states + self.collab_alpha * self.collab_dropout(exp_delta)
             experts_new = experts_new * keep_mask.unsqueeze(-1)
 
         return mediator_new, experts_new, (attn if self.save_attn_weights else None)
@@ -766,8 +778,8 @@ class MoCTopKExperts(nn.Module):
 
             # This loop is intentionally kept: each expert has distinct parameters.
             for e in range(self.n_experts):
-                s = int(starts[e].item())
-                t = int(ends[e].item())
+                s = int(starts[e].tolist())
+                t = int(ends[e].tolist())
                 chunk_size = t - s
                 if chunk_size == 0:
                     continue
@@ -1184,7 +1196,7 @@ if __name__ == "__main__":
     model.train()
     logits, loss_tuple, _, debug = model(idx, targets=targets)
     total_loss, ce_loss, aux_loss = loss_tuple
-    print(f"Losses -> total: {total_loss.item():.4f}, ce: {ce_loss.item():.4f}, aux: {aux_loss.item():.6f}")
+    print(f"Losses -> total: {total_loss.tolist():.4f}, ce: {ce_loss.tolist():.4f}, aux: {aux_loss.tolist():.6f}")
     print("Debug keys:", None if debug is None else list(debug.keys()))
     assert logits.shape == (bsz, seqlen, cfg.vocab_size)
 
