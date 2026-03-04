@@ -3,12 +3,13 @@
 # Lunaris MoC — Mixture-of-Collaboration with Adaptive Compute
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Paper](https://img.shields.io/badge/Technical%20Report-PDF-red.svg)](paper/lunaris-moc.pdf)
 
 **A decoder-only Transformer with collaborative expert routing and learned per-token compute allocation.**
 
 Developed independently by [Francisco Antonio](https://github.com/MeryylleA) — a 17-year-old researcher from Brazil 🇧🇷
 
-[🤗 Datasets](https://huggingface.co/meryyllebr543)
+[📄 Technical Report](paper/lunaris-moc.pdf) · [🤗 Datasets](https://huggingface.co/meryyllebr543)
 
 </div>
 
