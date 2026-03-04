@@ -131,46 +131,49 @@ class ShardDataset(Dataset):
         self.mmap_shards: List[np.ndarray] = [np.load(str(p), mmap_mode="r") for p in self.shards]
         self.shard_lengths = [int(len(x)) for x in self.mmap_shards]
         self.total_tokens = int(sum(self.shard_lengths))
-        self.total_samples = self.total_tokens // self.sequence_length
+        self.total_samples = max(0, (self.total_tokens - 1) // self.sequence_length)
         self.cumulative_lengths = np.cumsum(self.shard_lengths)
 
     def __len__(self) -> int:
         return self.total_samples
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Return (x, y, valid_len_y) for one fixed-length training sample."""
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return one full-length (x, y) sample without runtime padding."""
+        if idx < 0 or idx >= self.total_samples:
+            raise IndexError(f"Sample index out of range: idx={idx}, total_samples={self.total_samples}")
+
         seq_len = self.sequence_length
         token_start = idx * seq_len
         shard_idx = int(np.searchsorted(self.cumulative_lengths, token_start, side="right"))
         local_start = token_start if shard_idx == 0 else token_start - int(self.cumulative_lengths[shard_idx - 1])
 
         needed = seq_len + 1
-        current = self.mmap_shards[shard_idx]
-        current_len = self.shard_lengths[shard_idx]
+        remaining = needed
+        chunks: List[np.ndarray] = []
 
-        if local_start + needed <= current_len:
-            seq = current[local_start : local_start + needed]
-        else:
-            first = current[local_start:]
-            remain = needed - len(first)
-            if shard_idx + 1 < len(self.mmap_shards):
-                second = self.mmap_shards[shard_idx + 1][:remain]
-                seq = np.concatenate((first, second))
-            else:
-                seq = first
+        while remaining > 0 and shard_idx < len(self.mmap_shards):
+            shard = self.mmap_shards[shard_idx]
+            available = self.shard_lengths[shard_idx] - local_start
+            take = min(remaining, max(0, available))
 
-        original_len = int(len(seq))
-        valid_len_y = int(max(0, min(seq_len, original_len - 1)))
+            if take > 0:
+                chunks.append(shard[local_start : local_start + take])
+                remaining -= take
 
-        if original_len < needed:
-            pad_len = needed - original_len
-            pad_val = np.array(0, dtype=seq.dtype)
-            seq = np.pad(seq, (0, pad_len), mode="constant", constant_values=pad_val)
+            shard_idx += 1
+            local_start = 0
 
-        seq_t = torch.from_numpy(seq)
+        if remaining != 0:
+            raise IndexError(
+                f"Unable to build full sample for idx={idx} (needed={needed}, missing={remaining}). "
+                f"Check shard boundaries or dataset size."
+            )
+
+        seq = chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
+        seq_t = torch.as_tensor(seq)
         x = seq_t[:-1]
         y = seq_t[1:]
-        return x, y, valid_len_y
+        return x, y
 
 
 def get_lr(step: int, config: TrainConfig) -> float:
@@ -216,10 +219,49 @@ def apply_ignore_mask(y: torch.Tensor, valid_len_y: Optional[torch.Tensor | Sequ
 
     t = torch.arange(y.shape[1], device=y.device).unsqueeze(0)
     pad_mask = t >= valid_len_y.unsqueeze(1)
-    if torch.any(pad_mask):
-        y = y.clone()
-        y[pad_mask] = -1
-    return y
+    return y.masked_fill(pad_mask, -1)
+
+
+def unpack_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor | Sequence[int]]]:
+    """Normalize dataloader output to (x, y, valid_len_y?)."""
+    if isinstance(batch, (tuple, list)) and len(batch) == 3:
+        x, y, valid_len_y = batch
+        return x, y, valid_len_y
+    if isinstance(batch, (tuple, list)) and len(batch) == 2:
+        x, y = batch
+        return x, y, None
+    raise ValueError("Expected batch to be (x, y) or (x, y, valid_len_y).")
+
+
+def estimate_batch_token_count(
+    x: torch.Tensor, valid_len_y: Optional[torch.Tensor | Sequence[int]]
+) -> int:
+    """Count real target tokens for throughput accounting."""
+    if valid_len_y is None:
+        # No padding path: all tokens are valid.
+        return int(x.numel())
+
+    if torch.is_tensor(valid_len_y):
+        valid_cpu = valid_len_y.detach()
+        if valid_cpu.device.type != "cpu":
+            valid_cpu = valid_cpu.to(device="cpu", non_blocking=False)
+        return int(valid_cpu.sum().item())
+
+    return int(np.asarray(valid_len_y, dtype=np.int64).sum())
+
+
+def move_batch_to_device(
+    batch: Any, device: torch.device, non_blocking: bool
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Move one batch to target device and apply padding mask only when provided."""
+    x, y, valid_len_y = unpack_batch(batch)
+    token_count = estimate_batch_token_count(x, valid_len_y)
+    sample_count = int(x.shape[0])
+    x = x.to(device, dtype=torch.long, non_blocking=non_blocking)
+    y = y.to(device, dtype=torch.long, non_blocking=non_blocking)
+    if valid_len_y is not None:
+        y = apply_ignore_mask(y, valid_len_y)
+    return x, y, token_count, sample_count
 
 
 def compute_active_params_per_token(model: LunarisCodex) -> Tuple[int, int]:
@@ -597,15 +639,7 @@ def run_validation(
                 val_iter = iter(val_loader)
                 batch = next(val_iter)
 
-            if isinstance(batch, (tuple, list)) and len(batch) == 3:
-                x, y, valid_len_y = batch
-            else:
-                x, y = batch
-                valid_len_y = None
-
-            x = x.to(device, dtype=torch.long, non_blocking=True)
-            y = y.to(device, dtype=torch.long, non_blocking=True)
-            y = apply_ignore_mask(y, valid_len_y)
+            x, y, _, _ = move_batch_to_device(batch, device=device, non_blocking=(device.type == "cuda"))
 
             with make_autocast_context("cuda" if device.type == "cuda" else "cpu", amp_dtype):
                 _, loss_tuple, _, debug_payload = model(x, targets=y, past_key_values=None)
@@ -1008,6 +1042,33 @@ def train(config_path: str) -> None:
     pbar = tqdm(total=config.max_steps, initial=current_step, desc="train", dynamic_ncols=True) if is_master else None
 
     train_iter = iter(train_loader)
+    use_cuda_prefetch = device.type == "cuda"
+    prefetch_stream = torch.cuda.Stream(device=device) if use_cuda_prefetch else None
+
+    def fetch_next_cpu_batch() -> Optional[Any]:
+        nonlocal train_iter, current_epoch
+        try:
+            return next(train_iter)
+        except StopIteration:
+            current_epoch += 1
+            train_iter = iter(train_loader)
+            try:
+                return next(train_iter)
+            except StopIteration:
+                return None
+
+    def prefetch_next_batch() -> Optional[Tuple[torch.Tensor, torch.Tensor, int, int]]:
+        cpu_batch = fetch_next_cpu_batch()
+        if cpu_batch is None:
+            return None
+
+        if use_cuda_prefetch:
+            assert prefetch_stream is not None
+            with torch.cuda.stream(prefetch_stream):
+                return move_batch_to_device(cpu_batch, device=device, non_blocking=True)
+
+        return move_batch_to_device(cpu_batch, device=device, non_blocking=False)
+
     last_log_time = time.time()
     steps_since_log = 0
     tokens_since_log = 0
@@ -1016,17 +1077,23 @@ def train(config_path: str) -> None:
     last_val_metrics: Optional[Dict[str, Any]] = None
 
     # Window accumulators (reset every log_interval).
-    window_total_loss = 0.0
-    window_ce_loss = 0.0
-    window_aux_loss = 0.0
+    window_total_loss = torch.zeros((), device=device)
+    window_ce_loss = torch.zeros((), device=device)
+    window_aux_loss = torch.zeros((), device=device)
     routing_window_log: Dict[int, Dict[str, Any]] = {}
     agreement_window_log: Dict[Tuple[int, int], Tuple[float, int]] = {}
     layer0_indices_window_log: List[torch.Tensor] = []
     reasoning_samples_log: List[float] = []
     collab_samples_log: List[float] = []
     gamma_window_log: Dict[int, List[float]] = {}
+    inv_grad_accum = 1.0 / max(1, config.gradient_accumulation_steps)
+    step_total_loss_sum = torch.zeros((), device=device)
+    step_ce_loss_sum = torch.zeros((), device=device)
+    step_aux_loss_sum = torch.zeros((), device=device)
+    last_logged_total_loss = float("nan")
 
     training_start = time.time()
+    prefetched_batch = prefetch_next_batch()
 
     while current_step < config.max_steps:
         current_step += 1
@@ -1036,36 +1103,32 @@ def train(config_path: str) -> None:
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        step_total_loss_sum = 0.0
-        step_ce_loss_sum = 0.0
-        step_aux_loss_sum = 0.0
+        do_log = config.log_interval > 0 and (current_step % config.log_interval == 0)
+        step_total_loss_sum.zero_()
+        step_ce_loss_sum.zero_()
+        step_aux_loss_sum.zero_()
 
         stop_for_epoch_end = False
 
         for micro in range(config.gradient_accumulation_steps):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                current_epoch += 1
-                train_iter = iter(train_loader)
-                try:
-                    batch = next(train_iter)
-                except StopIteration:
-                    stop_for_epoch_end = True
-                    break
+            if prefetched_batch is None:
+                stop_for_epoch_end = True
+                break
 
-            if isinstance(batch, (tuple, list)) and len(batch) == 3:
-                x, y, valid_len_y = batch
+            if use_cuda_prefetch:
+                assert prefetch_stream is not None
+                current_stream = torch.cuda.current_stream(device)
+                current_stream.wait_stream(prefetch_stream)
+                x, y, token_count, sample_count = prefetched_batch
+                x.record_stream(current_stream)
+                y.record_stream(current_stream)
             else:
-                x, y = batch
-                valid_len_y = None
+                x, y, token_count, sample_count = prefetched_batch
 
-            x = x.to(device, dtype=torch.long, non_blocking=True)
-            y = y.to(device, dtype=torch.long, non_blocking=True)
-            y = apply_ignore_mask(y, valid_len_y)
+            prefetched_batch = prefetch_next_batch()
 
-            tokens_since_log += int((y != -1).sum().item())
-            samples_since_log += int(x.size(0))
+            tokens_since_log += token_count
+            samples_since_log += sample_count
 
             autocast_ctx = make_autocast_context(device_type, amp_dtype)
             with autocast_ctx:
@@ -1077,20 +1140,22 @@ def train(config_path: str) -> None:
             total_loss, ce_loss, aux_loss = loss_tuple
             scaled_loss = total_loss / config.gradient_accumulation_steps
 
-            step_total_loss_sum += float(total_loss.detach().item()) / config.gradient_accumulation_steps
-            step_ce_loss_sum += float(ce_loss.detach().item()) / config.gradient_accumulation_steps
-            step_aux_loss_sum += float(aux_loss.detach().item()) / config.gradient_accumulation_steps
+            step_total_loss_sum.add_(total_loss.detach(), alpha=inv_grad_accum)
+            step_ce_loss_sum.add_(ce_loss.detach(), alpha=inv_grad_accum)
+            step_aux_loss_sum.add_(aux_loss.detach(), alpha=inv_grad_accum)
 
-            update_routing_window(
-                debug_payload=debug_payload,
-                routing_window=routing_window_log,
-                agreement_window=agreement_window_log,
-                layer0_indices_window=layer0_indices_window_log,
-                reasoning_samples=reasoning_samples_log,
-                collab_samples=collab_samples_log,
-                gamma_tracker=gamma_tracker,
-                gamma_window=gamma_window_log,
-            )
+            collect_routing_this_micro = do_log and (micro == config.gradient_accumulation_steps - 1)
+            if collect_routing_this_micro:
+                update_routing_window(
+                    debug_payload=debug_payload,
+                    routing_window=routing_window_log,
+                    agreement_window=agreement_window_log,
+                    layer0_indices_window=layer0_indices_window_log,
+                    reasoning_samples=reasoning_samples_log,
+                    collab_samples=collab_samples_log,
+                    gamma_tracker=gamma_tracker,
+                    gamma_window=gamma_window_log,
+                )
 
             if scaler.is_enabled():
                 scaler.scale(scaled_loss).backward()
@@ -1111,13 +1176,16 @@ def train(config_path: str) -> None:
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        window_total_loss += step_total_loss_sum
-        window_ce_loss += step_ce_loss_sum
-        window_aux_loss += step_aux_loss_sum
+        window_total_loss.add_(step_total_loss_sum)
+        window_ce_loss.add_(step_ce_loss_sum)
+        window_aux_loss.add_(step_aux_loss_sum)
 
         if pbar is not None:
             pbar.update(1)
-            pbar.set_postfix({"loss": f"{step_total_loss_sum:.3f}", "lr": f"{lr:.2e}"})
+            postfix = {"lr": f"{lr:.2e}"}
+            if math.isfinite(last_logged_total_loss):
+                postfix["loss"] = f"{last_logged_total_loss:.3f}"
+            pbar.set_postfix(postfix)
 
         do_validate = val_loader is not None and config.val_interval > 0 and (current_step % config.val_interval == 0)
         if do_validate:
@@ -1187,7 +1255,6 @@ def train(config_path: str) -> None:
             if is_master:
                 print(f"\n[CKPT] Saved: {numbered} and {latest}")
 
-        do_log = config.log_interval > 0 and (current_step % config.log_interval == 0)
         if do_log:
             log_counter += 1
             now = time.time()
@@ -1212,9 +1279,10 @@ def train(config_path: str) -> None:
                 model_cfg=raw_model.config,
             )
 
-            avg_total_loss = window_total_loss / max(1, steps_since_log)
-            avg_ce_loss = window_ce_loss / max(1, steps_since_log)
-            avg_aux_loss = window_aux_loss / max(1, steps_since_log)
+            avg_total_loss = float((window_total_loss / max(1, steps_since_log)).detach().item())
+            avg_ce_loss = float((window_ce_loss / max(1, steps_since_log)).detach().item())
+            avg_aux_loss = float((window_aux_loss / max(1, steps_since_log)).detach().item())
+            last_logged_total_loss = avg_total_loss
             ppl = math.exp(avg_ce_loss) if avg_ce_loss < 20 else float("inf")
             grad_scale = scaler.get_scale() if scaler.is_enabled() else 1.0
 
@@ -1317,9 +1385,9 @@ def train(config_path: str) -> None:
             steps_since_log = 0
             tokens_since_log = 0
             samples_since_log = 0
-            window_total_loss = 0.0
-            window_ce_loss = 0.0
-            window_aux_loss = 0.0
+            window_total_loss.zero_()
+            window_ce_loss.zero_()
+            window_aux_loss.zero_()
             routing_window_log = {}
             agreement_window_log = {}
             layer0_indices_window_log = []
