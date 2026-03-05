@@ -248,6 +248,8 @@ class Attention(nn.Module):
         self.wqkv = nn.Linear(config.d_model, q_size + 2 * kv_size, bias=False)
         self.o_proj = nn.Linear(q_size, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
+        self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
 
     def forward(
         self,
@@ -271,6 +273,8 @@ class Attention(nn.Module):
         k = k.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.view(bsz, seqlen, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
 
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = apply_rotary_emb(q, k, freqs_cis)
 
         past_len = 0
@@ -483,6 +487,7 @@ class MoCTopKExperts(nn.Module):
 
         self.med_mlp = nn.Sequential(
             nn.Linear(d_model, d_model, bias=False),
+            RMSNorm(d_model, eps=1e-6),
             nn.SiLU(),
             nn.Linear(d_model, d_model, bias=False),
         )
@@ -973,13 +978,13 @@ class LunarisCodex(nn.Module):
     def _rescale_out_projections(self):
         denom = math.sqrt(2 * self.config.n_layers)
         with torch.no_grad():
-            for m in self.modules():
-                if isinstance(m, Attention):
-                    m.o_proj.weight.mul_(1.0 / denom)
-                elif isinstance(m, ReasoningFeedForward):
-                    m.w2.weight.mul_(1.0 / denom)
-                elif isinstance(m, MoCTopKExperts):
-                    m.o_proj.weight.mul_(1.0 / denom)
+            for block in self.transformer.h:
+                block.attention.o_proj.weight.mul_(1.0 / denom)
+                if block.is_moe:
+                    # MoC path already includes expert projections; only rescale final fused output.
+                    block.feed_forward.o_proj.weight.mul_(1.0 / denom)
+                else:
+                    block.feed_forward.w2.weight.mul_(1.0 / denom)
 
     def forward(
         self,
