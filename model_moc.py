@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from optimizer_lr import make_param_group
+
 try:
     from torch.nn.attention import sdpa_kernel, SDPBackend
 except Exception:
@@ -1091,9 +1093,9 @@ class LunarisCodex(nn.Module):
 
         optimizer = torch.optim.AdamW(
             [
-                {"params": decay_params, "weight_decay": weight_decay},
-                {"params": nodecay_params, "weight_decay": 0.0},
-                {"params": router_params, "weight_decay": 0.0, "lr": learning_rate * 0.5},
+                make_param_group(decay_params, weight_decay=weight_decay),
+                make_param_group(nodecay_params, weight_decay=0.0),
+                make_param_group(router_params, weight_decay=0.0, lr_scale=0.5),
             ],
             **optim_kwargs,
         )
