@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import yaml
+from optimizer_lr import apply_param_group_lrs
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -1100,8 +1101,7 @@ def train(config_path: str) -> None:
         steps_since_log += 1
 
         lr = get_lr(current_step, config)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        apply_param_group_lrs(optimizer.param_groups, lr)
 
         do_log = config.log_interval > 0 and (current_step % config.log_interval == 0)
         step_total_loss_sum.zero_()
