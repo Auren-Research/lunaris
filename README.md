@@ -5,40 +5,43 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Paper](https://img.shields.io/badge/Technical%20Report-PDF-red.svg)](paper/lunaris-moc.pdf)
 
-**A decoder-only Transformer with collaborative expert routing and learned per-token compute allocation.**
+**A decoder-only Transformer with collaborative expert routing, iterative reasoning, and optional adaptive per-token compute allocation.**
 
 Developed independently by [Francisco Antonio](https://github.com/MeryylleA) — a 17-year-old researcher from Brazil 🇧🇷
 
-[📄 Technical Report](paper/lunaris-moc.pdf) · [🤗 Datasets](https://huggingface.co/meryyllebr543)
+[📄 Technical Report](paper/lunaris-moc.pdf) · [📈 Weights & Biases Dashboard](https://wandb.ai/smeryylle-moon-cloud-services-/lunaris-moc-validation) · [🤗 Datasets](https://huggingface.co/meryyllebr543)
 
 </div>
 
 ## What Is This?
 
-Lunaris MoC is a Transformer language model architecture where multiple experts **collaborate before producing output**, and the model **learns how much computation each token needs**.
+Lunaris MoC is a decoder-only Transformer architecture where selected experts **reason, collaborate, and then fuse their outputs**, while the model can optionally **learn how much computation each token needs**.
 
-Standard Mixture-of-Experts (MoE) routes each token to K experts, runs them independently, and averages the results. MoC does something different: the selected experts exchange information through a learned mediator before their outputs are fused. Inside each expert, an Iterative Reasoning Loop refines the representation across multiple steps. Both the number of reasoning steps and collaboration rounds are **learned per token** — the model allocates more compute to tokens that need it and skips unnecessary work on trivial tokens.
+Standard Mixture-of-Experts (MoE) routes each token to K experts, runs them independently, and merges the results. MoC does something different: the selected experts exchange information through a learned mediator before fusion. Inside each expert, an Iterative Reasoning Loop (IRL) can refine the representation across multiple steps. When adaptive compute is enabled, the model learns per-token reasoning depth and collaboration depth instead of spending the same amount of compute on every token.
 
-This repository contains two files:
+Core files in the repository:
 
-- `model_moc.py` — the complete model architecture
-- `train_moc.py` — the training script (single-GPU, bf16, full diagnostics)
+- `model_moc.py` — the model architecture
+- `train_moc.py` — the single-GPU training script with diagnostics and W&B logging
+- `optimizer_lr.py` — parameter-group learning-rate utilities used by training
+
+The `main` branch is intended to track the current implementation. Historical experiments and older code paths can live in separate branches, but the dashboard below is the easiest place to inspect raw runs and routing diagnostics.
 
 ---
 
-## 📊 Initial Experiments & Performance
+## 📊 Experiments & Tracking
 
-Early ablation studies and training runs demonstrate that the **MoC architecture consistently outperforms** both dense baselines (Vanilla) and standard Mixture-of-Experts (MoE) across key metrics. The charts below compare the validation and training trajectories over the first 200 steps.
+Latest runs, routing diagnostics, and ablation logs:
 
-<div align="center">
-  <img src="assets/val_loss.png" width="48%" alt="Validation Loss Comparison" />
-  <img src="assets/val_perplexity.png" width="48%" alt="Validation Perplexity Comparison" />
-</div>
-<br>
-<div align="center">
-  <img src="assets/train_loss_ce.png" width="48%" alt="Cross Entropy Loss" />
-  <img src="assets/train_loss_total.png" width="48%" alt="Total Training Loss" />
-</div>
+**W&B dashboard:** https://wandb.ai/smeryylle-moon-cloud-services-/lunaris-moc-validation
+
+A few grounded takeaways from the current pilot experiments:
+
+- In small-budget ablations, **MoC beats both the dense baseline and a standard MoE baseline** on validation loss / perplexity.
+- The current implementation keeps routing healthy in pilot runs: no dead experts in the reported experiments, low drop rates, and non-collapsed utilization.
+- A larger sparse run (~197M total trainable parameters) scaled without routing collapse and reached substantially lower validation perplexity than the earlier small-scale pilot.
+
+Because experiments so far span different hardware and model scales, the W&B panel should be treated as the source of truth for raw results. Static screenshots age like milk, so this README now links directly to the dashboard instead of embedding images.
 
 ---
 
@@ -269,7 +272,7 @@ When both `adaptive_reasoning` and `adaptive_collaboration` are enabled, the mod
 | `val_interval` | 500 | Steps between validation runs |
 | `val_batches` | 50 | Number of validation batches |
 | `early_stopping_patience` | 0 | Validations without improvement before stopping (0 = disabled) |
-| `wandb_project` | `null` | Weights & Biases project name (`null` = disabled) |
+| `wandb_project` | `"lunaris-codex-moc"` | Weights & Biases project name (`null` = disabled) |
 
 ---
 
@@ -371,7 +374,7 @@ The training script outputs a formatted monitor block every `log_interval` steps
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  LUNARIS CODEX v2 - MoC Training Monitor                                 ║
+║  LUNARIS MoC Training Monitor                                            ║
 ╠══════════════════════════════════════════════════════════════════════════╣
 ║  Step: 10000/20000  |  Epoch: 0  |  LR: 1.57e-04  |  ETA: 1h 52m         ║
 ╠══════════════════════════════════════════════════════════════════════════╣
@@ -409,12 +412,16 @@ The training script outputs a formatted monitor block every `log_interval` steps
 
 ### Weights & Biases Integration
 
-Enable wandb logging by setting `wandb_project` in the config:
+Enable W&B logging by setting `wandb_project` in the config:
 
 ```yaml
-wandb_project: "my-moc-training"
+wandb_project: "lunaris-moc-validation"
 wandb_run_name: "moc-384d-4exp-adaptive"
 ```
+
+Public dashboard used for current experiments:
+
+**https://wandb.ai/smeryylle-moon-cloud-services-/lunaris-moc-validation**
 
 The following metrics are logged automatically:
 
@@ -501,6 +508,8 @@ To isolate the contribution of each MoC component, train models with identical c
 
 Keep all other parameters identical: same data, same batch size, same learning rate, same number of steps. Compare using **validation cross-entropy loss** (not total loss, which includes auxiliary terms).
 
+For speed claims, keep the hardware fixed as well. A faster GPU can make a training script look magically better even when the architecture is unchanged — delightful for morale, terrible for attribution.
+
 ### Interpreting Routing Diagnostics
 
 **Expert utilization:** Watch the Gini coefficient per layer. Values below 0.3 indicate healthy distribution. Values above 0.5 suggest dominant experts. Some specialization is expected and healthy — the concern is when experts die (receive zero tokens for multiple log windows).
@@ -586,7 +595,7 @@ For a model with E experts and top-K routing, `active ≈ total - (E - K) × par
 
 - [x] Architecture implementation (MoC + IRL + adaptive compute)
 - [x] Production training script with full diagnostics
-- [ ] Technical paper
+- [x] Technical paper
 - [ ] Large-scale pre-training validation
 - [ ] Downstream task evaluation
 - [ ] Multi-GPU training support
