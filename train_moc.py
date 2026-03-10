@@ -71,10 +71,6 @@ class TrainConfig:
     rich_terminal: bool = True
     save_best: bool = True
 
-    # [OPT-1] RAM threshold for shard loading (bytes). Shards smaller than
-    # this are copied into contiguous RAM instead of using mmap, eliminating
-    # page-fault overhead during random-access reads.
-    shard_ram_threshold: int = 8_000_000_000
 
     @property
     def sequence_length(self) -> int:
@@ -122,13 +118,12 @@ class TrainConfig:
 
 
 # ---------------------------------------------------------------------------
-# Dataset — [OPT-1] RAM preload + [OPT-4/6] contiguous tensors
+# Dataset — mmap shards + contiguous tensor outputs
 # ---------------------------------------------------------------------------
 class ShardDataset(Dataset):
-    """Memory-mapped (or RAM-resident) token dataset over .npy shards."""
+    """Memory-mapped token dataset over .npy shards."""
 
-    def __init__(self, data_dir: str | Path, sequence_length: int,
-                 ram_threshold: int = 8_000_000_000):
+    def __init__(self, data_dir: str | Path, sequence_length: int):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.sequence_length = int(sequence_length)
@@ -137,14 +132,7 @@ class ShardDataset(Dataset):
         if len(self.shards) == 0:
             raise ValueError(f"No .npy shards found in: {self.data_dir}")
 
-        # [OPT-1] Load small shards into contiguous RAM to avoid mmap
-        # page-fault overhead during random-access training reads.
-        self.mmap_shards: List[np.ndarray] = []
-        for p in self.shards:
-            data = np.load(str(p), mmap_mode="r")
-            if data.nbytes < ram_threshold:
-                data = np.array(data)  # contiguous RAM copy
-            self.mmap_shards.append(data)
+        self.mmap_shards: List[np.ndarray] = [np.load(str(p), mmap_mode="r") for p in self.shards]
 
         self.shard_lengths = [int(len(x)) for x in self.mmap_shards]
         self.total_tokens = int(sum(self.shard_lengths))
@@ -184,10 +172,9 @@ class ShardDataset(Dataset):
                 f"Unable to build full sample for idx={idx} (needed={needed}, missing={remaining})."
             )
 
-        # [OPT-1] np.array() ensures writable contiguous copy, eliminating
-        # the "non-writable tensor" warning and avoiding internal PyTorch
-        # copies. [OPT-4/6] .contiguous() ensures optimal memory layout
-        # for pin_memory and GPU transfer.
+        # np.array() ensures a writable contiguous copy, eliminating the
+        # "non-writable tensor" warning and avoiding internal PyTorch copies.
+        # .contiguous() ensures optimal memory layout for pin_memory and GPU transfer.
         if len(chunks) == 1:
             seq_t = torch.from_numpy(np.array(chunks[0]))
         else:
@@ -584,13 +571,25 @@ def make_autocast_context(device_type: str, amp_dtype: Optional[torch.dtype]) ->
 
 
 # ---------------------------------------------------------------------------
-# [OPT-3] Routing diagnostics toggle — avoids computing bincount, entropy,
-# and histogram tensors on ~90% of forward passes.
+# [OPT-3] Routing diagnostics toggle — avoids computing routing stats on
+# most forward passes while correctly updating instantiated MoC layers.
 # ---------------------------------------------------------------------------
 def _set_routing_diagnostics(raw_model: LunarisCodex, enabled: bool) -> None:
-    """Toggle routing stats collection on the live config object."""
+    """Toggle routing diagnostics on both the config and instantiated MoC layers."""
     raw_model.config.track_routing_stats = enabled
     raw_model.config.return_routing_diagnostics = enabled
+
+    transformer = getattr(raw_model, "transformer", None)
+    blocks = getattr(transformer, "h", None)
+    if blocks is None:
+        return
+
+    for block in blocks:
+        ff = getattr(block, "feed_forward", None)
+        if ff is None:
+            continue
+        if hasattr(ff, "track_routing_stats"):
+            ff.track_routing_stats = enabled
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +841,7 @@ def build_monitor_block(
 
     block = [
         top,
-        row("  LUNARIS CODEX - MoC Training Monitor"),
+        row("  LUNARIS CODEX v2 - MoC Training Monitor"),
         sep,
         row(f"  Step: {step}/{max_steps}  |  Epoch: {epoch}  |  LR: {lr:.2e}  |  ETA: {format_eta(eta_s)}"),
         sep,
@@ -957,11 +956,9 @@ def train(config_path: str) -> None:
         )
         print("-" * 90)
 
-    # [OPT-1] Pass RAM threshold to dataset.
     train_dataset = ShardDataset(
         data_dir=config.data_dir,
         sequence_length=config.sequence_length,
-        ram_threshold=config.shard_ram_threshold,
     )
     train_loader = make_dataloader(train_dataset, config=config, shuffle=True, drop_last=True)
     if is_master:
@@ -976,7 +973,6 @@ def train(config_path: str) -> None:
         val_dataset = ShardDataset(
             data_dir=val_dir,
             sequence_length=config.sequence_length,
-            ram_threshold=config.shard_ram_threshold,
         )
         val_loader = make_dataloader(val_dataset, config=config, shuffle=False, drop_last=False)
         if is_master:
