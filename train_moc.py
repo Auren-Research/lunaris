@@ -257,12 +257,51 @@ def move_batch_to_device(
     x, y, valid_len_y = unpack_batch(batch)
     token_count = estimate_batch_token_count(x, valid_len_y)
     sample_count = int(x.shape[0])
-    # [OPT-5] Data is already int64 from NumPy; skip redundant dtype cast.
-    x = x.to(device, non_blocking=non_blocking)
-    y = y.to(device, non_blocking=non_blocking)
+    # Keep token indices explicit and robust across shard dtypes (e.g. uint16/int32).
+    # nn.Embedding expects integer index tensors; mirroring v2 avoids silent dtype landmines.
+    x = x.to(device, dtype=torch.long, non_blocking=non_blocking)
+    y = y.to(device, dtype=torch.long, non_blocking=non_blocking)
     if valid_len_y is not None:
         y = apply_ignore_mask(y, valid_len_y)
     return x, y, token_count, sample_count
+
+
+def get_gpu_memory_stats(device: torch.device) -> Dict[str, float]:
+    """Return GPU memory stats that better match driver-visible VRAM usage.
+
+    torch.cuda.memory_allocated() only measures live tensor allocations and can badly
+    under-report what tools like nvidia-smi show, especially with the caching allocator,
+    CUDA graphs, compiler workspaces, and library workspaces. Prefer mem_get_info()
+    (device-visible used memory) and keep PyTorch allocator stats for debugging.
+    """
+    stats = {
+        "used_gib": 0.0,
+        "total_gib": 0.0,
+        "reserved_gib": 0.0,
+        "allocated_gib": 0.0,
+        "peak_reserved_gib": 0.0,
+        "peak_allocated_gib": 0.0,
+    }
+    if device.type != "cuda":
+        return stats
+
+    props = torch.cuda.get_device_properties(device)
+    stats["total_gib"] = props.total_memory / (1024**3)
+    stats["reserved_gib"] = torch.cuda.memory_reserved(device) / (1024**3)
+    stats["allocated_gib"] = torch.cuda.memory_allocated(device) / (1024**3)
+    stats["peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / (1024**3)
+    stats["peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / (1024**3)
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        stats["total_gib"] = total_bytes / (1024**3)
+        stats["used_gib"] = (total_bytes - free_bytes) / (1024**3)
+    except Exception:
+        stats["used_gib"] = stats["reserved_gib"]
+
+    # Never under-report relative to the allocator view if the driver query is noisy.
+    stats["used_gib"] = max(stats["used_gib"], stats["reserved_gib"], stats["allocated_gib"])
+    return stats
 
 
 def compute_active_params_per_token(model: LunarisCodex) -> Tuple[int, int]:
@@ -1285,11 +1324,9 @@ def train(config_path: str) -> None:
             samples_per_s = samples_since_log / elapsed
             ms_per_step = sec_per_step * 1000.0
 
-            mem_used_gib = 0.0
-            mem_total_gib = 0.0
-            if device.type == "cuda":
-                mem_used_gib = torch.cuda.memory_allocated(device) / (1024**3)
-                mem_total_gib = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+            mem_stats = get_gpu_memory_stats(device)
+            mem_used_gib = mem_stats["used_gib"]
+            mem_total_gib = mem_stats["total_gib"]
 
             routing_summary = summarize_routing(
                 routing_window=routing_window_log,
@@ -1350,6 +1387,10 @@ def train(config_path: str) -> None:
                     "throughput/samples_per_s": samples_per_s,
                     "memory/used_gib": mem_used_gib,
                     "memory/total_gib": mem_total_gib,
+                    "memory/pytorch_reserved_gib": mem_stats["reserved_gib"],
+                    "memory/pytorch_allocated_gib": mem_stats["allocated_gib"],
+                    "memory/peak_reserved_gib": mem_stats["peak_reserved_gib"],
+                    "memory/peak_allocated_gib": mem_stats["peak_allocated_gib"],
                     "grad/norm": float(grad_norm),
                     "grad/scale": float(grad_scale),
                     "routing/avg_reasoning_steps": routing_summary["avg_reasoning"],
