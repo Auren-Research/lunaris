@@ -29,21 +29,30 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# Norm fallback for older torch builds
+# RMSNorm with dtype-aligned weights to avoid bf16/fp32 fused-kernel mismatch
 # -----------------------------------------------------------------------------
 class _FallbackRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.normalized_shape = (dim,)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return x * self.weight
+        x_norm = x * torch.rsqrt(var + self.eps)
+        return x_norm * self.weight.to(dtype=x.dtype)
 
 
-RMSNorm = nn.RMSNorm if hasattr(nn, "RMSNorm") else _FallbackRMSNorm
+if hasattr(nn, "RMSNorm"):
+    class RMSNorm(nn.RMSNorm):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            weight = self.weight
+            if weight is not None and weight.dtype != x.dtype:
+                weight = weight.to(dtype=x.dtype)
+            return F.rms_norm(x, self.normalized_shape, weight, self.eps)
+else:
+    RMSNorm = _FallbackRMSNorm
 
 
 # -----------------------------------------------------------------------------
