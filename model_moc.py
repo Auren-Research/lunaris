@@ -29,30 +29,21 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# RMSNorm with dtype-aligned weights to avoid bf16/fp32 fused-kernel mismatch
+# Norm fallback for older torch builds
 # -----------------------------------------------------------------------------
 class _FallbackRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
-        self.normalized_shape = (dim,)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x * torch.rsqrt(var + self.eps)
-        return x_norm * self.weight.to(dtype=x.dtype)
+        x = x * torch.rsqrt(var + self.eps)
+        return x * self.weight
 
 
-if hasattr(nn, "RMSNorm"):
-    class RMSNorm(nn.RMSNorm):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            weight = self.weight
-            if weight is not None and weight.dtype != x.dtype:
-                weight = weight.to(dtype=x.dtype)
-            return F.rms_norm(x, self.normalized_shape, weight, self.eps)
-else:
-    RMSNorm = _FallbackRMSNorm
+RMSNorm = nn.RMSNorm if hasattr(nn, "RMSNorm") else _FallbackRMSNorm
 
 
 # -----------------------------------------------------------------------------
@@ -98,6 +89,14 @@ class LunarisCodexConfig:
 
     # IRL reasoning depth (interpreted as max steps)
     n_reasoning_steps: int = 1
+    # Momentum coefficient for IRL steps (0 = no momentum, 0.9 = strong momentum).
+    # Accumulates velocity across reasoning steps so the loop converges faster by
+    # building speed in directions where successive updates agree.
+    irl_momentum_beta: float = 0.9
+
+    # Fuse gate auxiliary signals (can be toggled independently via YAML)
+    use_fuse_conf: bool = True   # router max-prob confidence signal
+    use_fuse_delta: bool = True  # collaboration delta-norm signal
 
     # Adaptive compute
     adaptive_reasoning: bool = True
@@ -345,6 +344,11 @@ class ReasoningFeedForward(nn.Module):
 
         self.max_reasoning_steps = max(1, int(getattr(config, "n_reasoning_steps", 1)))
         self.alpha = 1.0 / math.sqrt(float(self.max_reasoning_steps))
+        # Momentum coefficient: β ∈ [0, 1).  β=0 recovers the original plain residual.
+        # At each step the velocity v is updated as v ← β·v + upd, then h ← h + α·v.
+        # This lets the IRL loop accelerate in directions where successive FFN outputs
+        # agree, and dampens oscillations when they disagree.
+        self.irl_momentum_beta = float(getattr(config, "irl_momentum_beta", 0.9))
 
         self.adaptive_reasoning = bool(getattr(config, "adaptive_reasoning", True)) and self.max_reasoning_steps > 1
         self.adaptive_mode = str(getattr(config, "adaptive_compute_mode", "soft")).lower()
@@ -375,11 +379,15 @@ class ReasoningFeedForward(nn.Module):
 
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
         h = x
+        beta = self.irl_momentum_beta
 
         if self.step_gate is None:
+            # Fixed-depth IRL with momentum.
+            v = torch.zeros_like(h)
             for _ in range(self.max_reasoning_steps):
                 upd = self._ffn_logic(self.norm(h + x))
-                h = h + self.alpha * upd
+                v = beta * v + upd          # accumulate velocity
+                h = h + self.alpha * v
             expected = x.new_full((x.size(0),), float(self.max_reasoning_steps), dtype=torch.float32)
         else:
             step_logits = self.step_gate(x.to(torch.float32))
@@ -395,6 +403,8 @@ class ReasoningFeedForward(nn.Module):
 
             if self.adaptive_mode == "hard":
                 # Sparse execution path: runs deeper IRL only for selected tokens.
+                # Each token carries its own velocity; inactive tokens keep v=0.
+                v = torch.zeros_like(h)
                 for step in range(self.max_reasoning_steps):
                     active = activity[:, step] > 0.5
                     if not torch.any(active):
@@ -402,14 +412,20 @@ class ReasoningFeedForward(nn.Module):
                     active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
                     h_sel = h.index_select(0, active_idx)
                     x_sel = x.index_select(0, active_idx)
+                    v_sel = v.index_select(0, active_idx)
                     upd = self._ffn_logic(self.norm(h_sel + x_sel))
-                    h_sel = h_sel + self.alpha * upd
+                    v_sel = beta * v_sel + upd
+                    h_sel = h_sel + self.alpha * v_sel
                     h.index_copy_(0, active_idx, h_sel)
+                    v.index_copy_(0, active_idx, v_sel)
             else:
+                # Soft / compile-friendly path with momentum.
                 activity = activity.to(dtype=x.dtype)
+                v = torch.zeros_like(h)
                 for step in range(self.max_reasoning_steps):
                     upd = self._ffn_logic(self.norm(h + x))
-                    h = h + activity[:, step : step + 1] * self.alpha * upd
+                    v = beta * v + upd
+                    h = h + activity[:, step : step + 1] * self.alpha * v
 
         self.last_expected_steps = expected.detach().mean()
         if self.reasoning_step_penalty_weight > 0.0 and self.max_reasoning_steps > 0:
@@ -506,13 +522,36 @@ class MoCTopKExperts(nn.Module):
         self.collab_dropout = nn.Dropout(float(getattr(config, "moc_collab_dropout", 0.0)))
 
         if self.moc_use_mediator:
-            self.mediator = nn.Parameter(torch.empty(1, d_model))
-            nn.init.normal_(self.mediator, mean=0.0, std=0.02)
+            # One learned anchor per expert instead of a single shared vector.
+            # A single mediator vector forces all expert representations — which may
+            # live in very different subspaces — to collapse onto one starting point.
+            # Per-expert slots let the token-specific mediator be initialised as a
+            # routing-weighted mixture, so it already lives in the subspace of the
+            # experts that were actually activated for that token.
+            self.mediator_slots = nn.Parameter(torch.empty(self.n_experts, d_model))
+            nn.init.normal_(self.mediator_slots, mean=0.0, std=0.02)
         else:
-            self.mediator = None
+            self.mediator_slots = None
 
         self.med_context = nn.Linear(d_model, d_model, bias=False)
+        # Trust gate: maps pre-mediation signals (token repr + router confidence) to a
+        # scalar γ ∈ (0,1).  γ weights mediator vs. weighted-expert output.
+        # Crucially, neither the mediator output nor weighted_refined is ever seen here —
+        # trust is decided before the diagnosis is given, like a patient deciding
+        # whether to trust a doctor before hearing what the doctor has to say.
         self.fuse_gate = nn.Linear(d_model, 1, bias=True)
+        # Auxiliary scalar that converts router max-probability into a trust signal.
+        # Higher router certainty → the mediator had less ambiguous input to synthesise,
+        # so the gate can afford to lean on it more.
+        self.use_fuse_conf = bool(getattr(config, "use_fuse_conf", True))
+        self.fuse_conf_proj = nn.Linear(1, 1, bias=False) if self.use_fuse_conf else None
+        # Informed-delta signal: maps the L2 norm of (mediator − weighted_refined) to
+        # a scalar contribution to γ.  The *magnitude* of the divergence is safe to
+        # read — it reveals how much collaboration changed the output, not what the
+        # output is.  A large delta means synthesis did non-trivial work; a small delta
+        # means the mediator barely moved from the naive weighted sum.
+        self.use_fuse_delta = bool(getattr(config, "use_fuse_delta", True))
+        self.fuse_delta_proj = nn.Linear(1, 1, bias=False) if self.use_fuse_delta else None
 
         if self.moc_expert_feedback:
             self.med_to_exp = nn.Linear(d_model, d_model, bias=False)
@@ -647,13 +686,25 @@ class MoCTopKExperts(nn.Module):
         keep_mask: torch.Tensor,
         weights: torch.Tensor,
         no_kept: torch.Tensor,
+        topk_idx: torch.Tensor,    # [N, K] — which expert slot each position picked
+        topk_probs: torch.Tensor,  # [N, K] — raw routing probs (pre capacity-masking)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n_tokens, _, d_model = expert_states.shape
 
         weighted = torch.sum(expert_states * weights.unsqueeze(-1), dim=1)
 
-        if self.mediator is not None:
-            mediator = self.mediator.unsqueeze(0).expand(n_tokens, -1, -1).squeeze(1).to(expert_states.dtype)
+        if self.mediator_slots is not None:
+            # Build a token-specific mediator by taking a routing-weighted mixture of
+            # the per-expert mediator anchors.  This ensures the mediator starts in the
+            # representational subspace spanned by the experts that are actually active
+            # for this token — avoiding the failure mode where a single shared anchor
+            # sits equidistant from (and therefore aligned with none of) the activated
+            # expert representations.
+            # topk_idx: [N, K]  →  gather slots: [N, K, D]
+            slots = self.mediator_slots[topk_idx.view(-1)].view(n_tokens, self.top_k, d_model)
+            # weights: [N, K], normalised routing probs for active experts
+            mediator = (slots * weights.unsqueeze(-1).to(slots.dtype)).sum(dim=1)
+            mediator = mediator.to(expert_states.dtype)
             mediator = mediator + self.med_context(x_flat.to(expert_states.dtype))
         else:
             mediator = weighted + self.med_context(x_flat.to(expert_states.dtype))
@@ -713,7 +764,25 @@ class MoCTopKExperts(nn.Module):
         expert_states = expert_states * keep_mask.unsqueeze(-1)
         weighted_refined = torch.sum(expert_states * weights.unsqueeze(-1), dim=1)
 
-        gamma = torch.sigmoid(self.fuse_gate(x_flat.to(weighted_refined.dtype)))
+        # ── Fuse gate (trust-before-diagnosis, informed by collaboration delta) ───
+        # γ is computed from three signals:
+        #   1. x_flat      — token identity (pre-mediation)
+        #   2. router_conf — routing certainty (pre-mediation)
+        #   3. delta_norm  — L2 norm of (mediator − weighted_refined), i.e. how much
+        #                    the collaboration synthesis diverged from the naive weighted
+        #                    expert sum.  This reveals the *magnitude* of what changed,
+        #                    never the absolute values — so the gate stays blind to the
+        #                    actual diagnosis while learning whether the process was
+        #                    consequential.  Large delta → collaboration did real work →
+        #                    the gate can learn to lean into (or away from) that signal.
+        router_conf = topk_probs.max(dim=-1, keepdim=True).values.to(x_flat.dtype)  # [N, 1]
+        delta_norm = (mediator - weighted_refined).norm(dim=-1, keepdim=True).to(x_flat.dtype)  # [N, 1]
+        gate_logit = self.fuse_gate(x_flat.to(weighted_refined.dtype))
+        if self.use_fuse_conf and self.fuse_conf_proj is not None:
+            gate_logit = gate_logit + self.fuse_conf_proj(router_conf.to(weighted_refined.dtype))
+        if self.use_fuse_delta and self.fuse_delta_proj is not None:
+            gate_logit = gate_logit + self.fuse_delta_proj(delta_norm.to(weighted_refined.dtype))
+        gamma = torch.sigmoid(gate_logit)
         fused = gamma * mediator + (1.0 - gamma) * weighted_refined
         fused = torch.where(no_kept, x_flat.to(fused.dtype), fused)
 
@@ -831,6 +900,8 @@ class MoCTopKExperts(nn.Module):
                 keep_mask=kept_mask_nk,
                 weights=weights,
                 no_kept=no_kept,
+                topk_idx=topk_idx,
+                topk_probs=topk_probs,
             )
 
         aux_loss = aux_loss + reasoning_penalty + collab_penalty
