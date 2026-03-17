@@ -31,9 +31,6 @@ except Exception:
     plt = None
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
     """Training configuration loaded from YAML."""
@@ -71,13 +68,14 @@ class TrainConfig:
     rich_terminal: bool = True
     save_best: bool = True
 
-
     @property
     def sequence_length(self) -> int:
+        """Alias used by dataset setup."""
         return int(self.model.max_seq_len)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainConfig":
+        """Build TrainConfig from YAML and force routing diagnostics on."""
         config_path = Path(path)
         with config_path.open("r", encoding="utf-8") as f:
             payload = yaml.safe_load(f) or {}
@@ -89,12 +87,14 @@ class TrainConfig:
             raise ValueError("`model` must be a mapping in YAML config")
         model_cfg = LunarisCodexConfig(**model_cfg_raw)
 
+        # Always on for training diagnostics.
         model_cfg.return_routing_diagnostics = True
         model_cfg.track_routing_stats = True
 
         payload["model"] = model_cfg
         cfg = cls(**payload)
 
+        # Normalize numeric user inputs.
         cfg.learning_rate = float(cfg.learning_rate)
         cfg.weight_decay = float(cfg.weight_decay)
         cfg.beta1 = float(cfg.beta1)
@@ -117,9 +117,6 @@ class TrainConfig:
         return cfg
 
 
-# ---------------------------------------------------------------------------
-# Dataset — mmap shards + contiguous tensor outputs
-# ---------------------------------------------------------------------------
 class ShardDataset(Dataset):
     """Memory-mapped token dataset over .npy shards."""
 
@@ -133,7 +130,6 @@ class ShardDataset(Dataset):
             raise ValueError(f"No .npy shards found in: {self.data_dir}")
 
         self.mmap_shards: List[np.ndarray] = [np.load(str(p), mmap_mode="r") for p in self.shards]
-
         self.shard_lengths = [int(len(x)) for x in self.mmap_shards]
         self.total_tokens = int(sum(self.shard_lengths))
         self.total_samples = max(0, (self.total_tokens - 1) // self.sequence_length)
@@ -143,6 +139,7 @@ class ShardDataset(Dataset):
         return self.total_samples
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return one full-length (x, y) sample without runtime padding."""
         if idx < 0 or idx >= self.total_samples:
             raise IndexError(f"Sample index out of range: idx={idx}, total_samples={self.total_samples}")
 
@@ -169,26 +166,19 @@ class ShardDataset(Dataset):
 
         if remaining != 0:
             raise IndexError(
-                f"Unable to build full sample for idx={idx} (needed={needed}, missing={remaining})."
+                f"Unable to build full sample for idx={idx} (needed={needed}, missing={remaining}). "
+                f"Check shard boundaries or dataset size."
             )
 
-        # np.array() ensures a writable contiguous copy, eliminating the
-        # "non-writable tensor" warning and avoiding internal PyTorch copies.
-        # .contiguous() ensures optimal memory layout for pin_memory and GPU transfer.
-        if len(chunks) == 1:
-            seq_t = torch.from_numpy(np.array(chunks[0]))
-        else:
-            seq_t = torch.from_numpy(np.concatenate(chunks, axis=0))
-
-        x = seq_t[:-1].contiguous()
-        y = seq_t[1:].contiguous()
+        seq = chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
+        seq_t = torch.as_tensor(seq)
+        x = seq_t[:-1]
+        y = seq_t[1:]
         return x, y
 
 
-# ---------------------------------------------------------------------------
-# Helpers (unchanged logic, minor perf tweaks)
-# ---------------------------------------------------------------------------
 def get_lr(step: int, config: TrainConfig) -> float:
+    """Linear warmup followed by cosine decay to 1% base LR."""
     if step < config.warmup_steps:
         return config.learning_rate * (step / max(1, config.warmup_steps))
     if step >= config.max_steps:
@@ -199,6 +189,7 @@ def get_lr(step: int, config: TrainConfig) -> float:
 
 
 def unwrap_model_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip common wrappers from checkpoint keys."""
     out: Dict[str, Any] = {}
     prefixes = ("_orig_mod.module.", "module.", "_orig_mod.")
     for k, v in state_dict.items():
@@ -212,23 +203,28 @@ def unwrap_model_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def to_float(x: Any) -> float:
+    """Convert scalar tensor-like values to Python float."""
     if isinstance(x, torch.Tensor):
         return float(x.detach().float().item())
     return float(x)
 
 
 def apply_ignore_mask(y: torch.Tensor, valid_len_y: Optional[torch.Tensor | Sequence[int]]) -> torch.Tensor:
+    """Apply ignore_index=-1 to padded targets on GPU."""
     if valid_len_y is None:
         return y
+
     if not torch.is_tensor(valid_len_y):
         valid_len_y = torch.as_tensor(valid_len_y, device=y.device)
     valid_len_y = valid_len_y.to(device=y.device, dtype=torch.long)
+
     t = torch.arange(y.shape[1], device=y.device).unsqueeze(0)
     pad_mask = t >= valid_len_y.unsqueeze(1)
     return y.masked_fill(pad_mask, -1)
 
 
 def unpack_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor | Sequence[int]]]:
+    """Normalize dataloader output to (x, y, valid_len_y?)."""
     if isinstance(batch, (tuple, list)) and len(batch) == 3:
         x, y, valid_len_y = batch
         return x, y, valid_len_y
@@ -241,24 +237,27 @@ def unpack_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch
 def estimate_batch_token_count(
     x: torch.Tensor, valid_len_y: Optional[torch.Tensor | Sequence[int]]
 ) -> int:
+    """Count real target tokens for throughput accounting."""
     if valid_len_y is None:
+        # No padding path: all tokens are valid.
         return int(x.numel())
+
     if torch.is_tensor(valid_len_y):
         valid_cpu = valid_len_y.detach()
         if valid_cpu.device.type != "cpu":
             valid_cpu = valid_cpu.to(device="cpu", non_blocking=False)
         return int(valid_cpu.sum().item())
+
     return int(np.asarray(valid_len_y, dtype=np.int64).sum())
 
 
 def move_batch_to_device(
     batch: Any, device: torch.device, non_blocking: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Move one batch to target device and apply padding mask only when provided."""
     x, y, valid_len_y = unpack_batch(batch)
     token_count = estimate_batch_token_count(x, valid_len_y)
     sample_count = int(x.shape[0])
-    # Keep token indices explicit and robust across shard dtypes (e.g. uint16/int32).
-    # nn.Embedding expects integer index tensors; mirroring v2 avoids silent dtype landmines.
     x = x.to(device, dtype=torch.long, non_blocking=non_blocking)
     y = y.to(device, dtype=torch.long, non_blocking=non_blocking)
     if valid_len_y is not None:
@@ -266,45 +265,8 @@ def move_batch_to_device(
     return x, y, token_count, sample_count
 
 
-def get_gpu_memory_stats(device: torch.device) -> Dict[str, float]:
-    """Return GPU memory stats that better match driver-visible VRAM usage.
-
-    torch.cuda.memory_allocated() only measures live tensor allocations and can badly
-    under-report what tools like nvidia-smi show, especially with the caching allocator,
-    CUDA graphs, compiler workspaces, and library workspaces. Prefer mem_get_info()
-    (device-visible used memory) and keep PyTorch allocator stats for debugging.
-    """
-    stats = {
-        "used_gib": 0.0,
-        "total_gib": 0.0,
-        "reserved_gib": 0.0,
-        "allocated_gib": 0.0,
-        "peak_reserved_gib": 0.0,
-        "peak_allocated_gib": 0.0,
-    }
-    if device.type != "cuda":
-        return stats
-
-    props = torch.cuda.get_device_properties(device)
-    stats["total_gib"] = props.total_memory / (1024**3)
-    stats["reserved_gib"] = torch.cuda.memory_reserved(device) / (1024**3)
-    stats["allocated_gib"] = torch.cuda.memory_allocated(device) / (1024**3)
-    stats["peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / (1024**3)
-    stats["peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / (1024**3)
-
-    try:
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-        stats["total_gib"] = total_bytes / (1024**3)
-        stats["used_gib"] = (total_bytes - free_bytes) / (1024**3)
-    except Exception:
-        stats["used_gib"] = stats["reserved_gib"]
-
-    # Never under-report relative to the allocator view if the driver query is noisy.
-    stats["used_gib"] = max(stats["used_gib"], stats["reserved_gib"], stats["allocated_gib"])
-    return stats
-
-
 def compute_active_params_per_token(model: LunarisCodex) -> Tuple[int, int]:
+    """Estimate active parameters per token under top-k expert routing."""
     total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     reduction = 0
     for block in model.transformer.h:
@@ -321,6 +283,7 @@ def compute_active_params_per_token(model: LunarisCodex) -> Tuple[int, int]:
 
 
 def format_eta(seconds: float) -> str:
+    """Format ETA in h/m style."""
     sec = max(0, int(seconds))
     h = sec // 3600
     m = (sec % 3600) // 60
@@ -328,6 +291,7 @@ def format_eta(seconds: float) -> str:
 
 
 def gini_coefficient(x: torch.Tensor) -> float:
+    """Compute Gini coefficient for non-negative values."""
     x = x.detach().float().flatten()
     if x.numel() == 0:
         return 0.0
@@ -342,18 +306,25 @@ def gini_coefficient(x: torch.Tensor) -> float:
 
 
 def supports_color() -> bool:
+    """Return True if stdout supports ANSI colors."""
     return sys.stdout.isatty()
 
 
 def colorize(text: str, level: str) -> str:
+    """Color text for terminal readability."""
     if not supports_color():
         return text
-    code = {"green": "\033[92m", "yellow": "\033[93m", "red": "\033[91m"}.get(level, "")
+    code = {
+        "green": "\033[92m",
+        "yellow": "\033[93m",
+        "red": "\033[91m",
+    }.get(level, "")
     reset = "\033[0m" if code else ""
     return f"{code}{text}{reset}"
 
 
 def register_gamma_hooks(raw_model: LunarisCodex) -> Tuple[Dict[int, float], List[Any]]:
+    """Register hooks to capture sigmoid(fuse_gate(x)) mean per MoE layer."""
     gamma_tracker: Dict[int, float] = {}
     handles: List[Any] = []
 
@@ -363,6 +334,7 @@ def register_gamma_hooks(raw_model: LunarisCodex) -> Tuple[Dict[int, float], Lis
                 gamma_tracker[layer_idx] = float(torch.sigmoid(output).detach().float().mean().item())
             except Exception:
                 pass
+
         return hook
 
     for i, block in enumerate(raw_model.transformer.h):
@@ -375,8 +347,10 @@ def register_gamma_hooks(raw_model: LunarisCodex) -> Tuple[Dict[int, float], Lis
 
 
 def parse_debug_payload(debug_payload: Any) -> Tuple[Optional[List[Dict[str, torch.Tensor]]], Optional[List[torch.Tensor]]]:
+    """Extract routing diagnostics and expert indices from model debug payload."""
     if debug_payload is None:
         return None, None
+
     if isinstance(debug_payload, dict):
         routing = debug_payload.get("routing_diagnostics", None)
         experts = debug_payload.get("expert_indices", None)
@@ -387,12 +361,15 @@ def parse_debug_payload(debug_payload: Any) -> Tuple[Optional[List[Dict[str, tor
         if not isinstance(experts, list):
             experts = None
         return routing, experts
+
     if isinstance(debug_payload, list) and len(debug_payload) > 0 and isinstance(debug_payload[0], list):
         return None, debug_payload[0]
+
     return None, None
 
 
 def init_routing_entry(diag: Dict[str, Any]) -> Dict[str, Any]:
+    """Create accumulator entry for one routing layer."""
     req = torch.as_tensor(diag["requested_hist"]).detach().float().cpu()
     kept = torch.as_tensor(diag["kept_hist"]).detach().float().cpu()
     return {
@@ -417,6 +394,7 @@ def update_routing_window(
     gamma_tracker: Dict[int, float],
     gamma_window: Dict[int, List[float]],
 ) -> None:
+    """Accumulate routing/debug metrics for one forward pass."""
     routing_diags, expert_indices = parse_debug_payload(debug_payload)
 
     if routing_diags is not None:
@@ -469,6 +447,7 @@ def summarize_routing(
     dead_expert_streaks: Dict[Tuple[int, int], int],
     model_cfg: LunarisCodexConfig,
 ) -> Dict[str, Any]:
+    """Compute aggregated routing statistics for one log window."""
     layer_ids = sorted(routing_window.keys())
     per_layer: Dict[int, Dict[str, Any]] = {}
     warnings: List[str] = []
@@ -477,6 +456,7 @@ def summarize_routing(
         entry = routing_window[layer_idx]
         count = max(1, int(entry["count"]))
         kept_hist: torch.Tensor = entry["kept_hist"]
+        requested_hist: torch.Tensor = entry["requested_hist"]
 
         util = kept_hist / kept_hist.sum().clamp_min(1.0)
         gini = gini_coefficient(util)
@@ -488,13 +468,14 @@ def summarize_routing(
                 dead_expert_streaks[key] = dead_expert_streaks.get(key, 0) + 1
             else:
                 dead_expert_streaks[key] = 0
+
             if dead_expert_streaks[key] >= 3:
                 dead_count += 1
                 if dead_expert_streaks[key] == 3:
                     warnings.append(f"Layer {layer_idx}: expert {expert_idx} has received 0 tokens for 3 log windows")
 
         per_layer[layer_idx] = {
-            "requested_hist": entry["requested_hist"],
+            "requested_hist": requested_hist,
             "kept_hist": kept_hist,
             "utilization": util,
             "drop_rate": float(entry["drop_sum"] / count),
@@ -546,6 +527,7 @@ def summarize_routing(
 
 
 def select_routing_layers(layer_ids: List[int]) -> List[int]:
+    """Pick first/mid/last layers for compact terminal display."""
     if len(layer_ids) <= 2:
         return layer_ids
     mid = layer_ids[len(layer_ids) // 2]
@@ -558,10 +540,12 @@ def select_routing_layers(layer_ids: List[int]) -> List[int]:
 
 
 def cooccurrence_figure(layer_indices: List[torch.Tensor], n_experts: int) -> Optional[Any]:
+    """Create layer-0 utilization + co-occurrence visualization."""
     if plt is None or n_experts <= 0 or len(layer_indices) == 0:
         return None
+
     try:
-        all_idx = torch.cat(layer_indices, dim=0)
+        all_idx = torch.cat(layer_indices, dim=0)  # [N, T, K]
         k = int(all_idx.shape[-1])
         if k < 1:
             return None
@@ -604,36 +588,12 @@ def cooccurrence_figure(layer_indices: List[torch.Tensor], n_experts: int) -> Op
 
 
 def make_autocast_context(device_type: str, amp_dtype: Optional[torch.dtype]) -> Any:
+    """Build autocast context manager for the current precision mode."""
     if device_type != "cuda" or amp_dtype is None:
         return nullcontext()
     return torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
 
 
-# ---------------------------------------------------------------------------
-# [OPT-3] Routing diagnostics toggle — avoids computing routing stats on
-# most forward passes while correctly updating instantiated MoC layers.
-# ---------------------------------------------------------------------------
-def _set_routing_diagnostics(raw_model: LunarisCodex, enabled: bool) -> None:
-    """Toggle routing diagnostics on both the config and instantiated MoC layers."""
-    raw_model.config.track_routing_stats = enabled
-    raw_model.config.return_routing_diagnostics = enabled
-
-    transformer = getattr(raw_model, "transformer", None)
-    blocks = getattr(transformer, "h", None)
-    if blocks is None:
-        return
-
-    for block in blocks:
-        ff = getattr(block, "feed_forward", None)
-        if ff is None:
-            continue
-        if hasattr(ff, "track_routing_stats"):
-            ff.track_routing_stats = enabled
-
-
-# ---------------------------------------------------------------------------
-# Validation — [OPT-7] Leaner validation loop
-# ---------------------------------------------------------------------------
 @torch.no_grad()
 def run_validation(
     model: torch.nn.Module,
@@ -646,14 +606,12 @@ def run_validation(
     is_master: bool,
     gamma_tracker: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
+    """Run fixed-batch validation and return averaged metrics."""
     if len(val_loader) == 0:
         return {}
 
     was_training = model.training
     model.eval()
-
-    # [OPT-7] Enable diagnostics only for validation (we always want them here).
-    _set_routing_diagnostics(raw_model, True)
 
     saved_gamma: Dict[int, float] = {}
     if gamma_tracker is not None:
@@ -661,8 +619,9 @@ def run_validation(
         gamma_tracker.clear()
 
     try:
-        # [OPT-6] Single tensor accumulator instead of 3 separate scalars.
-        loss_accum = torch.zeros(3, device=device, dtype=torch.float32)
+        total_loss_sum = 0.0
+        ce_loss_sum = 0.0
+        aux_loss_sum = 0.0
         n = 0
 
         routing_window: Dict[int, Dict[str, Any]] = {}
@@ -690,9 +649,9 @@ def run_validation(
                 continue
 
             total_loss, ce_loss, aux_loss = loss_tuple
-            loss_accum[0] += total_loss.detach()
-            loss_accum[1] += ce_loss.detach()
-            loss_accum[2] += aux_loss.detach()
+            total_loss_sum += float(total_loss.detach().item())
+            ce_loss_sum += float(ce_loss.detach().item())
+            aux_loss_sum += float(aux_loss.detach().item())
             n += 1
 
             update_routing_window(
@@ -717,11 +676,9 @@ def run_validation(
         if n == 0:
             return {}
 
-        # [OPT-7] Single .item() call for the accumulator.
-        loss_avg = (loss_accum / n).cpu()
-        val_total = float(loss_avg[0])
-        val_ce = float(loss_avg[1])
-        val_aux = float(loss_avg[2])
+        val_total = total_loss_sum / n
+        val_ce = ce_loss_sum / n
+        val_aux = aux_loss_sum / n
         val_ppl = math.exp(val_ce) if val_ce < 20 else float("inf")
 
         out: Dict[str, Any] = {
@@ -756,18 +713,18 @@ def run_validation(
         if gamma_tracker is not None:
             gamma_tracker.clear()
             gamma_tracker.update(saved_gamma)
+
         if was_training:
             model.train()
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint helpers
-# ---------------------------------------------------------------------------
 def serialize_dead_expert_streaks(streaks: Dict[Tuple[int, int], int]) -> Dict[str, int]:
+    """Serialize tuple-keyed dead-expert state for checkpointing."""
     return {f"{k[0]}:{k[1]}": int(v) for k, v in streaks.items()}
 
 
 def deserialize_dead_expert_streaks(payload: Dict[str, int]) -> Dict[Tuple[int, int], int]:
+    """Deserialize dead-expert state from checkpoint."""
     out: Dict[Tuple[int, int], int] = {}
     for key, value in payload.items():
         try:
@@ -779,6 +736,7 @@ def deserialize_dead_expert_streaks(payload: Dict[str, int]) -> Dict[Tuple[int, 
 
 
 def gather_rng_state() -> Dict[str, Any]:
+    """Capture Python/NumPy/Torch RNG state."""
     state: Dict[str, Any] = {
         "torch": torch.get_rng_state(),
         "numpy": np.random.get_state(),
@@ -790,6 +748,7 @@ def gather_rng_state() -> Dict[str, Any]:
 
 
 def restore_rng_state(state: Dict[str, Any]) -> None:
+    """Restore RNG state when resuming."""
     if "torch" in state:
         torch.set_rng_state(state["torch"])
     if "numpy" in state:
@@ -800,9 +759,6 @@ def restore_rng_state(state: Dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
-# ---------------------------------------------------------------------------
-# Monitor block (terminal TUI)
-# ---------------------------------------------------------------------------
 def build_monitor_block(
     step: int,
     max_steps: int,
@@ -824,6 +780,7 @@ def build_monitor_block(
     mem_total_gib: float,
     model_cfg: LunarisCodexConfig,
 ) -> str:
+    """Render a compact formatted monitor block for terminal logging."""
     width = 74
 
     def fit(text: str) -> str:
@@ -920,6 +877,7 @@ def build_monitor_block(
 
 
 def make_dataloader(dataset: Dataset, config: TrainConfig, shuffle: bool, drop_last: bool) -> DataLoader:
+    """Create DataLoader with pinned/persistent/prefetch settings."""
     kwargs: Dict[str, Any] = {
         "batch_size": config.batch_size,
         "shuffle": shuffle,
@@ -933,13 +891,12 @@ def make_dataloader(dataset: Dataset, config: TrainConfig, shuffle: bool, drop_l
     return DataLoader(dataset, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# Main training loop
-# ---------------------------------------------------------------------------
 def train(config_path: str) -> None:
+    """Main training entrypoint."""
     config = TrainConfig.from_yaml(config_path)
     is_master = True
 
+    # Repro + CUDA perf knobs.
     seed = 1337
     random.seed(seed)
     np.random.seed(seed)
@@ -964,11 +921,13 @@ def train(config_path: str) -> None:
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Lazy W&B import.
     wandb = None
     wandb_run = None
     if is_master and config.wandb_project:
         try:
             import wandb as _wandb
+
             wandb = _wandb
             if config.wandb_run_name is None:
                 config.wandb_run_name = f"lunaris-moc-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -995,10 +954,7 @@ def train(config_path: str) -> None:
         )
         print("-" * 90)
 
-    train_dataset = ShardDataset(
-        data_dir=config.data_dir,
-        sequence_length=config.sequence_length,
-    )
+    train_dataset = ShardDataset(data_dir=config.data_dir, sequence_length=config.sequence_length)
     train_loader = make_dataloader(train_dataset, config=config, shuffle=True, drop_last=True)
     if is_master:
         print(
@@ -1009,10 +965,7 @@ def train(config_path: str) -> None:
     val_loader: Optional[DataLoader] = None
     val_dir = Path(config.data_dir) / "val"
     if val_dir.is_dir() and any(val_dir.glob("*.npy")):
-        val_dataset = ShardDataset(
-            data_dir=val_dir,
-            sequence_length=config.sequence_length,
-        )
+        val_dataset = ShardDataset(data_dir=val_dir, sequence_length=config.sequence_length)
         val_loader = make_dataloader(val_dataset, config=config, shuffle=False, drop_last=False)
         if is_master:
             print(
@@ -1041,23 +994,15 @@ def train(config_path: str) -> None:
 
     gamma_tracker, gamma_handles = register_gamma_hooks(raw_model)
 
-    # [OPT-2] torch.compile with cascading fallback.
     model: torch.nn.Module = raw_model
     if config.compile_model and device.type == "cuda":
-        compile_modes = ["reduce-overhead", "default"]
-        compiled = False
-        for mode in compile_modes:
-            try:
-                model = torch.compile(raw_model, mode=mode)
-                if is_master:
-                    print(f"[MODEL] torch.compile enabled (mode={mode})")
-                compiled = True
-                break
-            except Exception as e:
-                if is_master:
-                    print(f"[WARN] torch.compile mode={mode} failed: {e}")
-        if not compiled and is_master:
-            print("[WARN] All torch.compile modes failed; continuing in eager mode.")
+        try:
+            model = torch.compile(model, mode="max-autotune")
+            if is_master:
+                print("[MODEL] torch.compile enabled (mode=max-autotune)")
+        except Exception as e:
+            if is_master:
+                print(f"[WARN] torch.compile failed; continuing eager. Error: {e}")
 
     latest_ckpt = out_dir / "latest_checkpoint.pt"
     current_step = 0
@@ -1086,12 +1031,14 @@ def train(config_path: str) -> None:
     model.train()
 
     if wandb is not None:
-        wandb.log({
-            "meta/active_params_per_token": active_params,
-            "meta/total_trainable_params": total_params,
-            "meta/active_params_ratio": active_ratio,
-            "step": current_step,
-        })
+        wandb.log(
+            {
+                "meta/active_params_per_token": active_params,
+                "meta/total_trainable_params": total_params,
+                "meta/active_params_ratio": active_ratio,
+                "step": current_step,
+            }
+        )
 
     pbar = tqdm(total=config.max_steps, initial=current_step, desc="train", dynamic_ncols=True) if is_master else None
 
@@ -1115,10 +1062,12 @@ def train(config_path: str) -> None:
         cpu_batch = fetch_next_cpu_batch()
         if cpu_batch is None:
             return None
+
         if use_cuda_prefetch:
             assert prefetch_stream is not None
             with torch.cuda.stream(prefetch_stream):
                 return move_batch_to_device(cpu_batch, device=device, non_blocking=True)
+
         return move_batch_to_device(cpu_batch, device=device, non_blocking=False)
 
     last_log_time = time.time()
@@ -1128,8 +1077,10 @@ def train(config_path: str) -> None:
     log_counter = 0
     last_val_metrics: Optional[Dict[str, Any]] = None
 
-    # [OPT-6] Single 3-element tensor for window loss accumulation.
-    window_losses = torch.zeros(3, device=device)
+    # Window accumulators (reset every log_interval).
+    window_total_loss = torch.zeros((), device=device)
+    window_ce_loss = torch.zeros((), device=device)
+    window_aux_loss = torch.zeros((), device=device)
     routing_window_log: Dict[int, Dict[str, Any]] = {}
     agreement_window_log: Dict[Tuple[int, int], Tuple[float, int]] = {}
     layer0_indices_window_log: List[torch.Tensor] = []
@@ -1137,9 +1088,9 @@ def train(config_path: str) -> None:
     collab_samples_log: List[float] = []
     gamma_window_log: Dict[int, List[float]] = {}
     inv_grad_accum = 1.0 / max(1, config.gradient_accumulation_steps)
-
-    # [OPT-6] Single 3-element tensor for per-step loss accumulation.
-    step_losses = torch.zeros(3, device=device)
+    step_total_loss_sum = torch.zeros((), device=device)
+    step_ce_loss_sum = torch.zeros((), device=device)
+    step_aux_loss_sum = torch.zeros((), device=device)
     last_logged_total_loss = float("nan")
 
     training_start = time.time()
@@ -1153,11 +1104,10 @@ def train(config_path: str) -> None:
         apply_param_group_lrs(optimizer.param_groups, lr)
 
         do_log = config.log_interval > 0 and (current_step % config.log_interval == 0)
+        step_total_loss_sum.zero_()
+        step_ce_loss_sum.zero_()
+        step_aux_loss_sum.zero_()
 
-        # [OPT-3] Determine if this log step should also collect routing.
-        routing_due_this_log = do_log and ((log_counter + 1) % config.log_routing_every == 0)
-
-        step_losses.zero_()
         stop_for_epoch_end = False
 
         for micro in range(config.gradient_accumulation_steps):
@@ -1180,13 +1130,6 @@ def train(config_path: str) -> None:
             tokens_since_log += token_count
             samples_since_log += sample_count
 
-            # [OPT-3] Only enable routing diagnostics on the last micro-step
-            # of log steps that actually need routing data. This avoids
-            # bincount/entropy/histogram overhead on ~90%+ of forward passes.
-            is_last_micro = (micro == config.gradient_accumulation_steps - 1)
-            want_routing = routing_due_this_log and is_last_micro
-            _set_routing_diagnostics(raw_model, want_routing)
-
             autocast_ctx = make_autocast_context(device_type, amp_dtype)
             with autocast_ctx:
                 _, loss_tuple, _, debug_payload = model(x, targets=y, past_key_values=None)
@@ -1197,11 +1140,12 @@ def train(config_path: str) -> None:
             total_loss, ce_loss, aux_loss = loss_tuple
             scaled_loss = total_loss / config.gradient_accumulation_steps
 
-            step_losses[0].add_(total_loss.detach(), alpha=inv_grad_accum)
-            step_losses[1].add_(ce_loss.detach(), alpha=inv_grad_accum)
-            step_losses[2].add_(aux_loss.detach(), alpha=inv_grad_accum)
+            step_total_loss_sum.add_(total_loss.detach(), alpha=inv_grad_accum)
+            step_ce_loss_sum.add_(ce_loss.detach(), alpha=inv_grad_accum)
+            step_aux_loss_sum.add_(aux_loss.detach(), alpha=inv_grad_accum)
 
-            if want_routing:
+            collect_routing_this_micro = do_log and (micro == config.gradient_accumulation_steps - 1)
+            if collect_routing_this_micro:
                 update_routing_window(
                     debug_payload=debug_payload,
                     routing_window=routing_window_log,
@@ -1232,7 +1176,9 @@ def train(config_path: str) -> None:
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        window_losses += step_losses
+        window_total_loss.add_(step_total_loss_sum)
+        window_ce_loss.add_(step_ce_loss_sum)
+        window_aux_loss.add_(step_aux_loss_sum)
 
         if pbar is not None:
             pbar.update(1)
@@ -1241,7 +1187,6 @@ def train(config_path: str) -> None:
                 postfix["loss"] = f"{last_logged_total_loss:.3f}"
             pbar.set_postfix(postfix)
 
-        # --- Validation ---
         do_validate = val_loader is not None and config.val_interval > 0 and (current_step % config.val_interval == 0)
         if do_validate:
             last_val_metrics = run_validation(
@@ -1255,8 +1200,6 @@ def train(config_path: str) -> None:
                 is_master=is_master,
                 gamma_tracker=gamma_tracker,
             )
-            # Restore training-time diagnostics state (off by default).
-            _set_routing_diagnostics(raw_model, False)
 
             if len(last_val_metrics) > 0:
                 val_loss = float(last_val_metrics["val_loss"])
@@ -1289,7 +1232,6 @@ def train(config_path: str) -> None:
                         )
                     break
 
-        # --- Checkpointing ---
         do_checkpoint = config.save_interval > 0 and (current_step % config.save_interval == 0)
         if do_checkpoint:
             ckpt_state = {
@@ -1313,7 +1255,6 @@ def train(config_path: str) -> None:
             if is_master:
                 print(f"\n[CKPT] Saved: {numbered} and {latest}")
 
-        # --- Logging ---
         if do_log:
             log_counter += 1
             now = time.time()
@@ -1324,9 +1265,11 @@ def train(config_path: str) -> None:
             samples_per_s = samples_since_log / elapsed
             ms_per_step = sec_per_step * 1000.0
 
-            mem_stats = get_gpu_memory_stats(device)
-            mem_used_gib = mem_stats["used_gib"]
-            mem_total_gib = mem_stats["total_gib"]
+            mem_used_gib = 0.0
+            mem_total_gib = 0.0
+            if device.type == "cuda":
+                mem_used_gib = torch.cuda.memory_allocated(device) / (1024**3)
+                mem_total_gib = torch.cuda.get_device_properties(device).total_memory / (1024**3)
 
             routing_summary = summarize_routing(
                 routing_window=routing_window_log,
@@ -1336,11 +1279,9 @@ def train(config_path: str) -> None:
                 model_cfg=raw_model.config,
             )
 
-            # [OPT-6] Single tensor division + cpu transfer.
-            avg_losses = (window_losses / max(1, steps_since_log)).cpu()
-            avg_total_loss = float(avg_losses[0])
-            avg_ce_loss = float(avg_losses[1])
-            avg_aux_loss = float(avg_losses[2])
+            avg_total_loss = float((window_total_loss / max(1, steps_since_log)).detach().item())
+            avg_ce_loss = float((window_ce_loss / max(1, steps_since_log)).detach().item())
+            avg_aux_loss = float((window_aux_loss / max(1, steps_since_log)).detach().item())
             last_logged_total_loss = avg_total_loss
             ppl = math.exp(avg_ce_loss) if avg_ce_loss < 20 else float("inf")
             grad_scale = scaler.get_scale() if scaler.is_enabled() else 1.0
@@ -1387,10 +1328,6 @@ def train(config_path: str) -> None:
                     "throughput/samples_per_s": samples_per_s,
                     "memory/used_gib": mem_used_gib,
                     "memory/total_gib": mem_total_gib,
-                    "memory/pytorch_reserved_gib": mem_stats["reserved_gib"],
-                    "memory/pytorch_allocated_gib": mem_stats["allocated_gib"],
-                    "memory/peak_reserved_gib": mem_stats["peak_reserved_gib"],
-                    "memory/peak_allocated_gib": mem_stats["peak_allocated_gib"],
                     "grad/norm": float(grad_norm),
                     "grad/scale": float(grad_scale),
                     "routing/avg_reasoning_steps": routing_summary["avg_reasoning"],
@@ -1444,12 +1381,13 @@ def train(config_path: str) -> None:
 
                 wandb.log(log_data)
 
-            # Reset window accumulators.
             last_log_time = now
             steps_since_log = 0
             tokens_since_log = 0
             samples_since_log = 0
-            window_losses.zero_()
+            window_total_loss.zero_()
+            window_ce_loss.zero_()
+            window_aux_loss.zero_()
             routing_window_log = {}
             agreement_window_log = {}
             layer0_indices_window_log = []
@@ -1457,7 +1395,6 @@ def train(config_path: str) -> None:
             collab_samples_log = []
             gamma_window_log = {}
 
-    # --- Cleanup ---
     if pbar is not None:
         pbar.close()
 
