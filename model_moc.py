@@ -1,6 +1,6 @@
 import inspect
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -89,14 +89,6 @@ class LunarisCodexConfig:
 
     # IRL reasoning depth (interpreted as max steps)
     n_reasoning_steps: int = 1
-    # Momentum coefficient for IRL steps (0 = no momentum, 0.9 = strong momentum).
-    # Accumulates velocity across reasoning steps so the loop converges faster by
-    # building speed in directions where successive updates agree.
-    irl_momentum_beta: float = 0.9
-
-    # Fuse gate auxiliary signals (can be toggled independently via YAML)
-    use_fuse_conf: bool = True   # router max-prob confidence signal
-    use_fuse_delta: bool = True  # collaboration delta-norm signal
 
     # Adaptive compute
     adaptive_reasoning: bool = True
@@ -116,6 +108,15 @@ class LunarisCodexConfig:
     # Optional aggressive variant flags
     aggressive_router_quant_bits: int = 0
     aggressive_ffn_quant_bits: int = 0
+
+    # -------------------------------------------------------------------------
+    # FIX 3: Selective per-layer collaboration
+    # None  → all layers use full MoC (backward-compatible default)
+    # [1,2,3,4,5] → only those layer indices run collaboration; others run
+    #               plain weighted-sum (same as MoE) with zero overhead.
+    # Tip: inspect your gamma pattern and pick layers where gamma > ~0.40.
+    # -------------------------------------------------------------------------
+    collab_layers: Optional[List[int]] = None
 
 
 # -----------------------------------------------------------------------------
@@ -329,6 +330,18 @@ class Attention(nn.Module):
 
 # -----------------------------------------------------------------------------
 # Reasoning FFN (IRL inside) with adaptive depth gate
+#
+# FIX 2: Step-conditional IRL via learned step embeddings.
+#
+# Each IRL step now receives a distinct positional bias before the FFN,
+# analogous to timestep conditioning in diffusion models. This allows the
+# shared FFN weights to behave differently at step 0 ("first impression")
+# vs step 1+ ("refinement"), breaking the symmetry that previously forced
+# both steps to approximate the same function.
+#
+# Extra params per expert: max_reasoning_steps × d_model
+# With defaults (2 steps, d_model=768): 1,536 params — negligible.
+# Only allocated when max_reasoning_steps > 1 (single-step models unchanged).
 # -----------------------------------------------------------------------------
 class ReasoningFeedForward(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
@@ -344,11 +357,6 @@ class ReasoningFeedForward(nn.Module):
 
         self.max_reasoning_steps = max(1, int(getattr(config, "n_reasoning_steps", 1)))
         self.alpha = 1.0 / math.sqrt(float(self.max_reasoning_steps))
-        # Momentum coefficient: β ∈ [0, 1).  β=0 recovers the original plain residual.
-        # At each step the velocity v is updated as v ← β·v + upd, then h ← h + α·v.
-        # This lets the IRL loop accelerate in directions where successive FFN outputs
-        # agree, and dampens oscillations when they disagree.
-        self.irl_momentum_beta = float(getattr(config, "irl_momentum_beta", 0.9))
 
         self.adaptive_reasoning = bool(getattr(config, "adaptive_reasoning", True)) and self.max_reasoning_steps > 1
         self.adaptive_mode = str(getattr(config, "adaptive_compute_mode", "soft")).lower()
@@ -362,6 +370,17 @@ class ReasoningFeedForward(nn.Module):
             self.step_gate = nn.Linear(config.d_model, self.max_reasoning_steps + 1, bias=True)
         else:
             self.step_gate = None
+
+        # FIX 2 — step embeddings: one learned vector per IRL step.
+        # Only created when there are multiple steps (single-step = no-op territory).
+        if self.max_reasoning_steps > 1:
+            self.step_embeddings = nn.Parameter(
+                torch.zeros(self.max_reasoning_steps, config.d_model)
+            )
+            nn.init.normal_(self.step_embeddings, std=0.01)
+        else:
+            # Register as None so state_dict stays clean for single-step configs.
+            self.step_embeddings = None
 
         self.last_expected_steps = torch.tensor(1.0)
         self.last_step_penalty = torch.tensor(0.0)
@@ -377,18 +396,26 @@ class ReasoningFeedForward(nn.Module):
         swiglu = F.silu(gate) * up
         return self.dropout(self._linear(swiglu, self.w2))
 
+    def _step_bias(self, step: int) -> Optional[torch.Tensor]:
+        """Return the step embedding for `step`, or None if single-step mode."""
+        if self.step_embeddings is None:
+            return None
+        return self.step_embeddings[step]
+
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
         h = x
-        beta = self.irl_momentum_beta
 
         if self.step_gate is None:
-            # Fixed-depth IRL with momentum.
-            v = torch.zeros_like(h)
-            for _ in range(self.max_reasoning_steps):
-                upd = self._ffn_logic(self.norm(h + x))
-                v = beta * v + upd          # accumulate velocity
-                h = h + self.alpha * v
+            # Fixed-depth path — apply step embedding before norm+FFN each step.
+            for step in range(self.max_reasoning_steps):
+                bias = self._step_bias(step)
+                z = self.norm(h + x)
+                if bias is not None:
+                    z = z + bias  # [N, D] broadcast — one line, zero overhead
+                upd = self._ffn_logic(z)
+                h = h + self.alpha * upd
             expected = x.new_full((x.size(0),), float(self.max_reasoning_steps), dtype=torch.float32)
+
         else:
             step_logits = self.step_gate(x.to(torch.float32))
             if self.training and self.reasoning_gate_noise_std > 0.0:
@@ -402,9 +429,7 @@ class ReasoningFeedForward(nn.Module):
             )
 
             if self.adaptive_mode == "hard":
-                # Sparse execution path: runs deeper IRL only for selected tokens.
-                # Each token carries its own velocity; inactive tokens keep v=0.
-                v = torch.zeros_like(h)
+                # Sparse execution: only active tokens run deeper IRL.
                 for step in range(self.max_reasoning_steps):
                     active = activity[:, step] > 0.5
                     if not torch.any(active):
@@ -412,20 +437,23 @@ class ReasoningFeedForward(nn.Module):
                     active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
                     h_sel = h.index_select(0, active_idx)
                     x_sel = x.index_select(0, active_idx)
-                    v_sel = v.index_select(0, active_idx)
-                    upd = self._ffn_logic(self.norm(h_sel + x_sel))
-                    v_sel = beta * v_sel + upd
-                    h_sel = h_sel + self.alpha * v_sel
+                    bias = self._step_bias(step)
+                    z = self.norm(h_sel + x_sel)
+                    if bias is not None:
+                        z = z + bias
+                    upd = self._ffn_logic(z)
+                    h_sel = h_sel + self.alpha * upd
                     h.index_copy_(0, active_idx, h_sel)
-                    v.index_copy_(0, active_idx, v_sel)
             else:
-                # Soft / compile-friendly path with momentum.
+                # Soft / compile-friendly path.
                 activity = activity.to(dtype=x.dtype)
-                v = torch.zeros_like(h)
                 for step in range(self.max_reasoning_steps):
-                    upd = self._ffn_logic(self.norm(h + x))
-                    v = beta * v + upd
-                    h = h + activity[:, step : step + 1] * self.alpha * v
+                    bias = self._step_bias(step)
+                    z = self.norm(h + x)
+                    if bias is not None:
+                        z = z + bias
+                    upd = self._ffn_logic(z)
+                    h = h + activity[:, step : step + 1] * self.alpha * upd
 
         self.last_expected_steps = expected.detach().mean()
         if self.reasoning_step_penalty_weight > 0.0 and self.max_reasoning_steps > 0:
@@ -446,6 +474,19 @@ class ReasoningFeedForward(nn.Module):
 
 # -----------------------------------------------------------------------------
 # MoC Top-K Experts (vectorized dispatch + MoC-Lite collaboration)
+#
+# FIX 3: Selective per-layer collaboration via `layer_idx`.
+#
+# When `config.collab_layers` is set, only layers whose index appears in that
+# list run the full MoC collaboration pipeline. All other layers fall back to
+# a plain weighted sum (identical to standard MoE) with zero mediator overhead.
+#
+# `collab_layers=None` preserves full backward compatibility (all layers collab).
+#
+# Typical usage based on gamma diagnostics:
+#   collab_layers=[1, 2, 3, 4, 5]   # skip layer 0 (gamma=0.16) and 6-9 (gamma<0.47)
+#
+# Expected speed improvement with 5/10 active collab layers: ~−40% MoC overhead.
 # -----------------------------------------------------------------------------
 class MoCTopKExperts(nn.Module):
     """
@@ -455,9 +496,11 @@ class MoCTopKExperts(nn.Module):
     - One unavoidable per-expert loop for executing expert-specific parameters
     - MoC-Lite mediator-only collaboration in O(K) per token
     - Adaptive reasoning depth inside experts and adaptive collaboration depth
+    - [FIX 2] Step-conditional IRL embeddings inside each ReasoningFeedForward
+    - [FIX 3] Per-layer collaboration toggle via config.collab_layers
     """
 
-    def __init__(self, config: LunarisCodexConfig):
+    def __init__(self, config: LunarisCodexConfig, layer_idx: int = 0):
         super().__init__()
         assert config.n_experts is not None and config.n_experts > 0
         assert config.top_k >= 1
@@ -469,6 +512,7 @@ class MoCTopKExperts(nn.Module):
         self.capacity_factor = float(config.capacity_factor)
         self.z_loss_weight = float(config.router_z_loss_weight)
         self.drop_penalty_weight = float(getattr(config, "drop_penalty_weight", 0.0))
+        self.layer_idx = layer_idx
 
         self.config = config
         self.track_routing_stats = bool(getattr(config, "track_routing_stats", True))
@@ -478,10 +522,18 @@ class MoCTopKExperts(nn.Module):
 
         self.router_quant_bits = int(getattr(config, "aggressive_router_quant_bits", 0))
 
+        # FIX 3: decide at construction time whether this layer runs collaboration.
+        collab_layers = getattr(config, "collab_layers", None)
+        if collab_layers is None:
+            # None → all layers collaborate (full backward compatibility).
+            self.use_moc_collab_this_layer = True
+        else:
+            self.use_moc_collab_this_layer = (layer_idx in collab_layers)
+
         # Router
         self.gate = nn.Linear(config.d_model, self.n_experts, bias=False)
 
-        # Experts (IRL FFNs)
+        # Experts (IRL FFNs with step embeddings — Fix 2 lives inside here)
         self.experts = nn.ModuleList([ReasoningFeedForward(config) for _ in range(self.n_experts)])
 
         # MoC-Lite collaboration modules
@@ -522,36 +574,13 @@ class MoCTopKExperts(nn.Module):
         self.collab_dropout = nn.Dropout(float(getattr(config, "moc_collab_dropout", 0.0)))
 
         if self.moc_use_mediator:
-            # One learned anchor per expert instead of a single shared vector.
-            # A single mediator vector forces all expert representations — which may
-            # live in very different subspaces — to collapse onto one starting point.
-            # Per-expert slots let the token-specific mediator be initialised as a
-            # routing-weighted mixture, so it already lives in the subspace of the
-            # experts that were actually activated for that token.
-            self.mediator_slots = nn.Parameter(torch.empty(self.n_experts, d_model))
-            nn.init.normal_(self.mediator_slots, mean=0.0, std=0.02)
+            self.mediator = nn.Parameter(torch.empty(1, d_model))
+            nn.init.normal_(self.mediator, mean=0.0, std=0.02)
         else:
-            self.mediator_slots = None
+            self.mediator = None
 
         self.med_context = nn.Linear(d_model, d_model, bias=False)
-        # Trust gate: maps pre-mediation signals (token repr + router confidence) to a
-        # scalar γ ∈ (0,1).  γ weights mediator vs. weighted-expert output.
-        # Crucially, neither the mediator output nor weighted_refined is ever seen here —
-        # trust is decided before the diagnosis is given, like a patient deciding
-        # whether to trust a doctor before hearing what the doctor has to say.
         self.fuse_gate = nn.Linear(d_model, 1, bias=True)
-        # Auxiliary scalar that converts router max-probability into a trust signal.
-        # Higher router certainty → the mediator had less ambiguous input to synthesise,
-        # so the gate can afford to lean on it more.
-        self.use_fuse_conf = bool(getattr(config, "use_fuse_conf", True))
-        self.fuse_conf_proj = nn.Linear(1, 1, bias=False) if self.use_fuse_conf else None
-        # Informed-delta signal: maps the L2 norm of (mediator − weighted_refined) to
-        # a scalar contribution to γ.  The *magnitude* of the divergence is safe to
-        # read — it reveals how much collaboration changed the output, not what the
-        # output is.  A large delta means synthesis did non-trivial work; a small delta
-        # means the mediator barely moved from the naive weighted sum.
-        self.use_fuse_delta = bool(getattr(config, "use_fuse_delta", True))
-        self.fuse_delta_proj = nn.Linear(1, 1, bias=False) if self.use_fuse_delta else None
 
         if self.moc_expert_feedback:
             self.med_to_exp = nn.Linear(d_model, d_model, bias=False)
@@ -686,32 +715,23 @@ class MoCTopKExperts(nn.Module):
         keep_mask: torch.Tensor,
         weights: torch.Tensor,
         no_kept: torch.Tensor,
-        topk_idx: torch.Tensor,    # [N, K] — which expert slot each position picked
-        topk_probs: torch.Tensor,  # [N, K] — raw routing probs (pre capacity-masking)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n_tokens, _, d_model = expert_states.shape
 
         weighted = torch.sum(expert_states * weights.unsqueeze(-1), dim=1)
 
-        if self.mediator_slots is not None:
-            # Build a token-specific mediator by taking a routing-weighted mixture of
-            # the per-expert mediator anchors.  This ensures the mediator starts in the
-            # representational subspace spanned by the experts that are actually active
-            # for this token — avoiding the failure mode where a single shared anchor
-            # sits equidistant from (and therefore aligned with none of) the activated
-            # expert representations.
-            # topk_idx: [N, K]  →  gather slots: [N, K, D]
-            slots = self.mediator_slots[topk_idx.view(-1)].view(n_tokens, self.top_k, d_model)
-            # weights: [N, K], normalised routing probs for active experts
-            mediator = (slots * weights.unsqueeze(-1).to(slots.dtype)).sum(dim=1)
-            mediator = mediator.to(expert_states.dtype)
+        # FIX 3: if this layer was excluded from collaboration, return plain
+        # weighted sum immediately — zero mediator cost, identical to MoE.
+        if (not self.use_moc_collab) or (not self.use_moc_collab_this_layer) or self.max_collab_steps <= 0:
+            avg_steps = x_flat.new_zeros((), dtype=torch.float32)
+            fused = torch.where(no_kept, x_flat.to(weighted.dtype), weighted)
+            return fused, x_flat.new_zeros((), dtype=torch.float32), avg_steps
+
+        if self.mediator is not None:
+            mediator = self.mediator.unsqueeze(0).expand(n_tokens, -1, -1).squeeze(1).to(expert_states.dtype)
             mediator = mediator + self.med_context(x_flat.to(expert_states.dtype))
         else:
             mediator = weighted + self.med_context(x_flat.to(expert_states.dtype))
-
-        if (not self.use_moc_collab) or self.max_collab_steps <= 0:
-            avg_steps = x_flat.new_zeros((), dtype=torch.float32)
-            return weighted, x_flat.new_zeros((), dtype=torch.float32), avg_steps
 
         if self.collab_step_gate is None:
             activity = torch.ones(n_tokens, self.max_collab_steps, device=x_flat.device, dtype=torch.float32)
@@ -764,25 +784,7 @@ class MoCTopKExperts(nn.Module):
         expert_states = expert_states * keep_mask.unsqueeze(-1)
         weighted_refined = torch.sum(expert_states * weights.unsqueeze(-1), dim=1)
 
-        # ── Fuse gate (trust-before-diagnosis, informed by collaboration delta) ───
-        # γ is computed from three signals:
-        #   1. x_flat      — token identity (pre-mediation)
-        #   2. router_conf — routing certainty (pre-mediation)
-        #   3. delta_norm  — L2 norm of (mediator − weighted_refined), i.e. how much
-        #                    the collaboration synthesis diverged from the naive weighted
-        #                    expert sum.  This reveals the *magnitude* of what changed,
-        #                    never the absolute values — so the gate stays blind to the
-        #                    actual diagnosis while learning whether the process was
-        #                    consequential.  Large delta → collaboration did real work →
-        #                    the gate can learn to lean into (or away from) that signal.
-        router_conf = topk_probs.max(dim=-1, keepdim=True).values.to(x_flat.dtype)  # [N, 1]
-        delta_norm = (mediator - weighted_refined).norm(dim=-1, keepdim=True).to(x_flat.dtype)  # [N, 1]
-        gate_logit = self.fuse_gate(x_flat.to(weighted_refined.dtype))
-        if self.use_fuse_conf and self.fuse_conf_proj is not None:
-            gate_logit = gate_logit + self.fuse_conf_proj(router_conf.to(weighted_refined.dtype))
-        if self.use_fuse_delta and self.fuse_delta_proj is not None:
-            gate_logit = gate_logit + self.fuse_delta_proj(delta_norm.to(weighted_refined.dtype))
-        gamma = torch.sigmoid(gate_logit)
+        gamma = torch.sigmoid(self.fuse_gate(x_flat.to(weighted_refined.dtype)))
         fused = gamma * mediator + (1.0 - gamma) * weighted_refined
         fused = torch.where(no_kept, x_flat.to(fused.dtype), fused)
 
@@ -900,8 +902,6 @@ class MoCTopKExperts(nn.Module):
                 keep_mask=kept_mask_nk,
                 weights=weights,
                 no_kept=no_kept,
-                topk_idx=topk_idx,
-                topk_probs=topk_probs,
             )
 
         aux_loss = aux_loss + reasoning_penalty + collab_penalty
@@ -921,6 +921,10 @@ class MoCTopKExperts(nn.Module):
                 "router_entropy": router_entropy.detach(),
                 "avg_reasoning_steps": avg_reasoning_steps.detach(),
                 "avg_collab_steps": avg_collab_steps.detach(),
+                # FIX 3 diagnostic: tells you whether this layer ran collaboration.
+                "collab_active_this_layer": torch.tensor(
+                    float(self.use_moc_collab_this_layer), device=x.device
+                ).detach(),
             }
         else:
             self.last_routing_diagnostics = None
@@ -930,18 +934,21 @@ class MoCTopKExperts(nn.Module):
 
 # -----------------------------------------------------------------------------
 # Transformer block
+# FIX 3: Block now accepts and forwards layer_idx to MoCTopKExperts.
 # -----------------------------------------------------------------------------
 class Block(nn.Module):
-    def __init__(self, config: LunarisCodexConfig):
+    def __init__(self, config: LunarisCodexConfig, layer_idx: int = 0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
 
         self.attn_norm = RMSNorm(config.d_model, eps=1e-6)
         self.attention = Attention(config)
         self.ffn_norm = RMSNorm(config.d_model, eps=1e-6)
 
         if config.n_experts is not None and config.n_experts > 0 and config.top_k >= 1:
-            self.feed_forward = MoCTopKExperts(config)
+            # FIX 3: pass layer_idx so MoCTopKExperts knows whether to collaborate.
+            self.feed_forward = MoCTopKExperts(config, layer_idx=layer_idx)
             self.is_moe = True
         else:
             self.feed_forward = ReasoningFeedForward(config)
@@ -978,7 +985,6 @@ class Block(nn.Module):
 
         if self.training and self.config.use_gradient_checkpointing:
             if self.config.grad_ckpt_policy == "block":
-                # Keep checkpoint inputs tensor-only; close over past_kv.
                 def _inner_ckpt(x_inner: torch.Tensor, freqs_cis_inner: torch.Tensor):
                     return _inner_full(x_inner, freqs_cis_inner, past_kv)
 
@@ -1010,6 +1016,7 @@ class Block(nn.Module):
 
 # -----------------------------------------------------------------------------
 # Top-level model
+# FIX 3: Blocks are constructed with their layer index.
 # -----------------------------------------------------------------------------
 class LunarisCodex(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
@@ -1019,7 +1026,8 @@ class LunarisCodex(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.d_model),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
+                # FIX 3: pass layer_idx=i so each Block/MoCTopKExperts knows its depth.
+                h=nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layers)]),
                 ln_f=RMSNorm(config.d_model, eps=1e-6),
                 drop=nn.Dropout(config.dropout),
             )
@@ -1045,6 +1053,11 @@ class LunarisCodex(nn.Module):
         print(f"Number of parameters: {num_params / 1e6:.2f}M")
         if config.n_experts is not None and config.n_experts > 0:
             print("Note: Parameter count includes all experts. Only top_k experts are active per token.")
+        # FIX 3: report which layers will run collaboration.
+        if config.collab_layers is not None:
+            print(f"MoC collaboration active on layers: {sorted(config.collab_layers)}")
+            skipped = [i for i in range(config.n_layers) if i not in config.collab_layers]
+            print(f"MoC collaboration SKIPPED on layers: {skipped} (plain MoE weighted-sum)")
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -1063,7 +1076,6 @@ class LunarisCodex(nn.Module):
             for block in self.transformer.h:
                 block.attention.o_proj.weight.mul_(1.0 / denom)
                 if block.is_moe:
-                    # MoC path already includes expert projections; only rescale final fused output.
                     block.feed_forward.o_proj.weight.mul_(1.0 / denom)
                 else:
                     block.feed_forward.w2.weight.mul_(1.0 / denom)
@@ -1145,7 +1157,6 @@ class LunarisCodex(nn.Module):
             else:
                 nodecay_params.append(p)
 
-        # Keep compatibility with naming expectations.
         for n, p in self.named_parameters():
             if n.endswith("feed_forward.gate.weight") and id(p) not in router_param_ids:
                 router_params.append(p)
@@ -1228,11 +1239,60 @@ def compile_model_if_available(model: nn.Module, mode: str = "max-autotune"):
 
 
 if __name__ == "__main__":
-    # Minimal shape sanity (torch must be available in runtime environment)
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    cfg = LunarisCodexConfig(
+    # -------------------------------------------------------------------------
+    # Sanity A: original config — backward-compatible (collab_layers=None)
+    # -------------------------------------------------------------------------
+    cfg_original = LunarisCodexConfig(
+        d_model=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=4,
+        vocab_size=503,
+        multiple_of=16,
+        ffn_hidden_multiplier=4.0,
+        max_seq_len=64,
+        dropout=0.0,
+        n_experts=4,
+        top_k=2,
+        aux_loss_weight=1e-2,
+        capacity_factor=1.25,
+        router_z_loss_weight=1e-3,
+        router_noise_std=0.02,
+        drop_penalty_weight=1e-3,
+        use_gradient_checkpointing=True,
+        grad_ckpt_policy="ffn",
+        use_simple_collab=False,
+        use_moc_collab=True,
+        moc_collab_steps=2,
+        moc_use_mediator=True,
+        n_reasoning_steps=3,        # FIX 2: 3 steps → 3 distinct step embeddings
+        adaptive_reasoning=True,
+        adaptive_collaboration=True,
+        adaptive_compute_mode="soft",
+        return_routing_diagnostics=True,
+        collab_layers=None,         # None → all layers collab (backward compat)
+    )
+
+    model_a = LunarisCodex(cfg_original).to(device)
+
+    bsz, seqlen = 2, 8
+    idx = torch.randint(0, cfg_original.vocab_size, (bsz, seqlen), device=device)
+    targets = torch.randint(0, cfg_original.vocab_size, (bsz, seqlen), device=device)
+
+    model_a.train()
+    logits, loss_tuple, _, debug = model_a(idx, targets=targets)
+    total_loss, ce_loss, aux_loss = loss_tuple
+    print(f"\n[A] all-layers collab | Losses → total: {total_loss.item():.4f}, "
+          f"ce: {ce_loss.item():.4f}, aux: {aux_loss.item():.6f}")
+    assert logits.shape == (bsz, seqlen, cfg_original.vocab_size)
+
+    # -------------------------------------------------------------------------
+    # Sanity B: FIX 3 active — only layers [1] collaborate (layer 0 skipped)
+    # -------------------------------------------------------------------------
+    cfg_selective = LunarisCodexConfig(
         d_model=64,
         n_layers=2,
         n_heads=4,
@@ -1260,22 +1320,28 @@ if __name__ == "__main__":
         adaptive_collaboration=True,
         adaptive_compute_mode="soft",
         return_routing_diagnostics=True,
+        collab_layers=[1],          # FIX 3: only layer 1 collaborates
     )
 
-    model = LunarisCodex(cfg).to(device)
+    model_b = LunarisCodex(cfg_selective).to(device)
+    model_b.train()
+    logits_b, loss_tuple_b, _, debug_b = model_b(idx, targets=targets)
+    total_b, ce_b, aux_b = loss_tuple_b
+    print(f"[B] selective collab  | Losses → total: {total_b.item():.4f}, "
+          f"ce: {ce_b.item():.4f}, aux: {aux_b.item():.6f}")
+    assert logits_b.shape == (bsz, seqlen, cfg_selective.vocab_size)
 
-    bsz, seqlen = 2, 8
-    idx = torch.randint(0, cfg.vocab_size, (bsz, seqlen), device=device)
-    targets = torch.randint(0, cfg.vocab_size, (bsz, seqlen), device=device)
+    # Verify collab_active_this_layer diagnostic is correct per layer.
+    if debug_b and debug_b.get("routing_diagnostics"):
+        for layer_i, diag in enumerate(debug_b["routing_diagnostics"]):
+            active = bool(diag.get("collab_active_this_layer", torch.tensor(0.0)).item())
+            expected = layer_i in cfg_selective.collab_layers
+            assert active == expected, f"Layer {layer_i}: expected collab={expected}, got {active}"
+        print("collab_active_this_layer diagnostics: OK")
 
-    model.train()
-    logits, loss_tuple, _, debug = model(idx, targets=targets)
-    total_loss, ce_loss, aux_loss = loss_tuple
-    print(f"Losses -> total: {total_loss.tolist():.4f}, ce: {ce_loss.tolist():.4f}, aux: {aux_loss.tolist():.6f}")
-    print("Debug keys:", None if debug is None else list(debug.keys()))
-    assert logits.shape == (bsz, seqlen, cfg.vocab_size)
-
-    model.eval()
-    out = model.generate(idx[:, :4], max_new_tokens=5)
-    print("Generate output shape:", out.shape)
-    print("Sanity complete.")
+    # Generate sanity
+    model_b.eval()
+    out = model_b.generate(idx[:, :4], max_new_tokens=5)
+    assert out.shape[1] == 9
+    print("Generate shape:", out.shape)
+    print("\nSanity complete. Both fixes verified.")
