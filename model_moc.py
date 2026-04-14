@@ -1,6 +1,6 @@
 import inspect
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -101,6 +101,9 @@ class LunarisCodexConfig:
     collaboration_gate_noise_std: float = 0.0
     collaboration_step_penalty_weight: float = 0.0
 
+    # Ouro-style entropy regularization for adaptive gates (prevents gate collapse)
+    gate_entropy_beta: float = 0.1
+
     # Diagnostics / debug payload
     track_routing_stats: bool = True
     return_routing_diagnostics: bool = False
@@ -108,15 +111,6 @@ class LunarisCodexConfig:
     # Optional aggressive variant flags
     aggressive_router_quant_bits: int = 0
     aggressive_ffn_quant_bits: int = 0
-
-    # -------------------------------------------------------------------------
-    # FIX 3: Selective per-layer collaboration
-    # None  → all layers use full MoC (backward-compatible default)
-    # [1,2,3,4,5] → only those layer indices run collaboration; others run
-    #               plain weighted-sum (same as MoE) with zero overhead.
-    # Tip: inspect your gamma pattern and pick layers where gamma > ~0.40.
-    # -------------------------------------------------------------------------
-    collab_layers: Optional[List[int]] = None
 
 
 # -----------------------------------------------------------------------------
@@ -215,7 +209,7 @@ def _compute_step_activity(
     max_steps: int,
     mode: str,
     temperature: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Convert logits over {0..max_steps} into per-step activity.
 
@@ -223,22 +217,26 @@ def _compute_step_activity(
       activity: [N, max_steps] in [0,1], where activity[:, s] means "run step s+1"
       expected_steps: [N]
       probs: [N, max_steps+1]
+      entropy: [] scalar — Shannon entropy of the step distribution (mean over batch)
     """
     temperature = max(float(temperature), 1e-4)
     probs = F.softmax(logits / temperature, dim=-1, dtype=torch.float32)
     step_values = torch.arange(max_steps + 1, device=logits.device, dtype=torch.float32)
     expected_steps = (probs * step_values.unsqueeze(0)).sum(dim=-1)
 
+    # Shannon entropy of gate distribution (Ouro Eq. 4 entropy term)
+    entropy = -(probs * torch.log(probs.clamp_min(1e-9))).sum(dim=-1).mean()
+
     mode = mode.lower()
     if mode == "hard":
         hard_steps = torch.argmax(probs, dim=-1)  # [N]
         thresholds = torch.arange(1, max_steps + 1, device=logits.device).unsqueeze(0)
         activity = (hard_steps.unsqueeze(-1) >= thresholds).to(torch.float32)
-        return activity, expected_steps, probs
+        return activity, expected_steps, probs, entropy
 
     # soft / compile-friendly mode
     tail = torch.flip(torch.cumsum(torch.flip(probs[:, 1:], dims=[-1]), dim=-1), dims=[-1])
-    return tail, expected_steps, probs
+    return tail, expected_steps, probs, entropy
 
 
 # -----------------------------------------------------------------------------
@@ -330,18 +328,6 @@ class Attention(nn.Module):
 
 # -----------------------------------------------------------------------------
 # Reasoning FFN (IRL inside) with adaptive depth gate
-#
-# FIX 2: Step-conditional IRL via learned step embeddings.
-#
-# Each IRL step now receives a distinct positional bias before the FFN,
-# analogous to timestep conditioning in diffusion models. This allows the
-# shared FFN weights to behave differently at step 0 ("first impression")
-# vs step 1+ ("refinement"), breaking the symmetry that previously forced
-# both steps to approximate the same function.
-#
-# Extra params per expert: max_reasoning_steps × d_model
-# With defaults (2 steps, d_model=768): 1,536 params — negligible.
-# Only allocated when max_reasoning_steps > 1 (single-step models unchanged).
 # -----------------------------------------------------------------------------
 class ReasoningFeedForward(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
@@ -366,24 +352,17 @@ class ReasoningFeedForward(nn.Module):
 
         self.ffn_quant_bits = int(getattr(config, "aggressive_ffn_quant_bits", 0))
 
+        # Ouro-style entropy regularization coefficient
+        self.gate_entropy_beta = float(getattr(config, "gate_entropy_beta", 0.1))
+
         if self.adaptive_reasoning:
             self.step_gate = nn.Linear(config.d_model, self.max_reasoning_steps + 1, bias=True)
         else:
             self.step_gate = None
 
-        # FIX 2 — step embeddings: one learned vector per IRL step.
-        # Only created when there are multiple steps (single-step = no-op territory).
-        if self.max_reasoning_steps > 1:
-            self.step_embeddings = nn.Parameter(
-                torch.zeros(self.max_reasoning_steps, config.d_model)
-            )
-            nn.init.normal_(self.step_embeddings, std=0.01)
-        else:
-            # Register as None so state_dict stays clean for single-step configs.
-            self.step_embeddings = None
-
         self.last_expected_steps = torch.tensor(1.0)
         self.last_step_penalty = torch.tensor(0.0)
+        self.last_gate_entropy_loss = torch.tensor(0.0)
 
     def _linear(self, x: torch.Tensor, layer: nn.Linear) -> torch.Tensor:
         w = layer.weight
@@ -396,40 +375,32 @@ class ReasoningFeedForward(nn.Module):
         swiglu = F.silu(gate) * up
         return self.dropout(self._linear(swiglu, self.w2))
 
-    def _step_bias(self, step: int) -> Optional[torch.Tensor]:
-        """Return the step embedding for `step`, or None if single-step mode."""
-        if self.step_embeddings is None:
-            return None
-        return self.step_embeddings[step]
-
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
         h = x
 
         if self.step_gate is None:
-            # Fixed-depth path — apply step embedding before norm+FFN each step.
-            for step in range(self.max_reasoning_steps):
-                bias = self._step_bias(step)
-                z = self.norm(h + x)
-                if bias is not None:
-                    z = z + bias  # [N, D] broadcast — one line, zero overhead
-                upd = self._ffn_logic(z)
+            for _ in range(self.max_reasoning_steps):
+                upd = self._ffn_logic(self.norm(h + x))
                 h = h + self.alpha * upd
             expected = x.new_full((x.size(0),), float(self.max_reasoning_steps), dtype=torch.float32)
-
+            gate_entropy_loss = x.new_zeros((), dtype=torch.float32)
         else:
             step_logits = self.step_gate(x.to(torch.float32))
             if self.training and self.reasoning_gate_noise_std > 0.0:
                 step_logits = step_logits + torch.randn_like(step_logits) * self.reasoning_gate_noise_std
 
-            activity, expected, _ = _compute_step_activity(
+            activity, expected, _, entropy = _compute_step_activity(
                 step_logits,
                 max_steps=self.max_reasoning_steps,
                 mode=self.adaptive_mode,
                 temperature=self.reasoning_gate_temperature,
             )
 
+            # Ouro Eq. 4: -beta * H(p) penalizes low entropy (collapse)
+            gate_entropy_loss = -self.gate_entropy_beta * entropy
+
             if self.adaptive_mode == "hard":
-                # Sparse execution: only active tokens run deeper IRL.
+                # Sparse execution path: runs deeper IRL only for selected tokens.
                 for step in range(self.max_reasoning_steps):
                     active = activity[:, step] > 0.5
                     if not torch.any(active):
@@ -437,22 +408,13 @@ class ReasoningFeedForward(nn.Module):
                     active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
                     h_sel = h.index_select(0, active_idx)
                     x_sel = x.index_select(0, active_idx)
-                    bias = self._step_bias(step)
-                    z = self.norm(h_sel + x_sel)
-                    if bias is not None:
-                        z = z + bias
-                    upd = self._ffn_logic(z)
+                    upd = self._ffn_logic(self.norm(h_sel + x_sel))
                     h_sel = h_sel + self.alpha * upd
                     h.index_copy_(0, active_idx, h_sel)
             else:
-                # Soft / compile-friendly path.
                 activity = activity.to(dtype=x.dtype)
                 for step in range(self.max_reasoning_steps):
-                    bias = self._step_bias(step)
-                    z = self.norm(h + x)
-                    if bias is not None:
-                        z = z + bias
-                    upd = self._ffn_logic(z)
+                    upd = self._ffn_logic(self.norm(h + x))
                     h = h + activity[:, step : step + 1] * self.alpha * upd
 
         self.last_expected_steps = expected.detach().mean()
@@ -462,6 +424,8 @@ class ReasoningFeedForward(nn.Module):
             ) * self.reasoning_step_penalty_weight
         else:
             self.last_step_penalty = x.new_zeros((), dtype=torch.float32)
+
+        self.last_gate_entropy_loss = gate_entropy_loss
 
         return h
 
@@ -474,19 +438,6 @@ class ReasoningFeedForward(nn.Module):
 
 # -----------------------------------------------------------------------------
 # MoC Top-K Experts (vectorized dispatch + MoC-Lite collaboration)
-#
-# FIX 3: Selective per-layer collaboration via `layer_idx`.
-#
-# When `config.collab_layers` is set, only layers whose index appears in that
-# list run the full MoC collaboration pipeline. All other layers fall back to
-# a plain weighted sum (identical to standard MoE) with zero mediator overhead.
-#
-# `collab_layers=None` preserves full backward compatibility (all layers collab).
-#
-# Typical usage based on gamma diagnostics:
-#   collab_layers=[1, 2, 3, 4, 5]   # skip layer 0 (gamma=0.16) and 6-9 (gamma<0.47)
-#
-# Expected speed improvement with 5/10 active collab layers: ~−40% MoC overhead.
 # -----------------------------------------------------------------------------
 class MoCTopKExperts(nn.Module):
     """
@@ -496,11 +447,9 @@ class MoCTopKExperts(nn.Module):
     - One unavoidable per-expert loop for executing expert-specific parameters
     - MoC-Lite mediator-only collaboration in O(K) per token
     - Adaptive reasoning depth inside experts and adaptive collaboration depth
-    - [FIX 2] Step-conditional IRL embeddings inside each ReasoningFeedForward
-    - [FIX 3] Per-layer collaboration toggle via config.collab_layers
     """
 
-    def __init__(self, config: LunarisCodexConfig, layer_idx: int = 0):
+    def __init__(self, config: LunarisCodexConfig):
         super().__init__()
         assert config.n_experts is not None and config.n_experts > 0
         assert config.top_k >= 1
@@ -512,7 +461,6 @@ class MoCTopKExperts(nn.Module):
         self.capacity_factor = float(config.capacity_factor)
         self.z_loss_weight = float(config.router_z_loss_weight)
         self.drop_penalty_weight = float(getattr(config, "drop_penalty_weight", 0.0))
-        self.layer_idx = layer_idx
 
         self.config = config
         self.track_routing_stats = bool(getattr(config, "track_routing_stats", True))
@@ -522,18 +470,10 @@ class MoCTopKExperts(nn.Module):
 
         self.router_quant_bits = int(getattr(config, "aggressive_router_quant_bits", 0))
 
-        # FIX 3: decide at construction time whether this layer runs collaboration.
-        collab_layers = getattr(config, "collab_layers", None)
-        if collab_layers is None:
-            # None → all layers collaborate (full backward compatibility).
-            self.use_moc_collab_this_layer = True
-        else:
-            self.use_moc_collab_this_layer = (layer_idx in collab_layers)
-
         # Router
         self.gate = nn.Linear(config.d_model, self.n_experts, bias=False)
 
-        # Experts (IRL FFNs with step embeddings — Fix 2 lives inside here)
+        # Experts (IRL FFNs)
         self.experts = nn.ModuleList([ReasoningFeedForward(config) for _ in range(self.n_experts)])
 
         # MoC-Lite collaboration modules
@@ -549,6 +489,9 @@ class MoCTopKExperts(nn.Module):
 
         self.moc_use_mediator = bool(getattr(config, "moc_use_mediator", True))
         self.moc_expert_feedback = bool(getattr(config, "moc_expert_feedback", True))
+
+        # Ouro-style entropy regularization coefficient
+        self.gate_entropy_beta = float(getattr(config, "gate_entropy_beta", 0.1))
 
         self.mediator_norm = RMSNorm(d_model, eps=1e-6)
         self.expert_norm = RMSNorm(d_model, eps=1e-6)
@@ -720,34 +663,34 @@ class MoCTopKExperts(nn.Module):
 
         weighted = torch.sum(expert_states * weights.unsqueeze(-1), dim=1)
 
-        # FIX 3: if this layer was excluded from collaboration, return plain
-        # weighted sum immediately — zero mediator cost, identical to MoE.
-        if (not self.use_moc_collab) or (not self.use_moc_collab_this_layer) or self.max_collab_steps <= 0:
-            avg_steps = x_flat.new_zeros((), dtype=torch.float32)
-            fused = torch.where(no_kept, x_flat.to(weighted.dtype), weighted)
-            return fused, x_flat.new_zeros((), dtype=torch.float32), avg_steps
-
         if self.mediator is not None:
             mediator = self.mediator.unsqueeze(0).expand(n_tokens, -1, -1).squeeze(1).to(expert_states.dtype)
             mediator = mediator + self.med_context(x_flat.to(expert_states.dtype))
         else:
             mediator = weighted + self.med_context(x_flat.to(expert_states.dtype))
 
+        if (not self.use_moc_collab) or self.max_collab_steps <= 0:
+            avg_steps = x_flat.new_zeros((), dtype=torch.float32)
+            return weighted, x_flat.new_zeros((), dtype=torch.float32), avg_steps
+
         if self.collab_step_gate is None:
             activity = torch.ones(n_tokens, self.max_collab_steps, device=x_flat.device, dtype=torch.float32)
             expected_steps = torch.full(
                 (n_tokens,), float(self.max_collab_steps), device=x_flat.device, dtype=torch.float32
             )
+            collab_entropy_loss = x_flat.new_zeros((), dtype=torch.float32)
         else:
             step_logits = self.collab_step_gate(x_flat.to(torch.float32))
             if self.training and self.collab_gate_noise_std > 0.0:
                 step_logits = step_logits + torch.randn_like(step_logits) * self.collab_gate_noise_std
-            activity, expected_steps, _ = _compute_step_activity(
+            activity, expected_steps, _, entropy = _compute_step_activity(
                 step_logits,
                 max_steps=self.max_collab_steps,
                 mode=self.adaptive_mode,
                 temperature=self.collab_gate_temperature,
             )
+            # Ouro Eq. 4: -beta * H(p) penalizes low entropy (collapse)
+            collab_entropy_loss = -self.gate_entropy_beta * entropy
 
         # Never spend collaboration compute when all experts were dropped.
         activity = activity * (~no_kept.squeeze(-1)).to(activity.dtype).unsqueeze(-1)
@@ -796,6 +739,9 @@ class MoCTopKExperts(nn.Module):
         else:
             collab_penalty = x_flat.new_zeros((), dtype=torch.float32)
 
+        # Add entropy regularization to collab penalty
+        collab_penalty = collab_penalty + collab_entropy_loss
+
         return fused, collab_penalty, avg_steps
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -839,6 +785,7 @@ class MoCTopKExperts(nn.Module):
         expert_out_selected = x_expanded.new_zeros((nk, d_model))
         reasoning_penalty = x_flat.new_zeros((), dtype=torch.float32)
         avg_reasoning_steps = x_flat.new_zeros((), dtype=torch.float32)
+        gate_entropy_loss_sum = x_flat.new_zeros((), dtype=torch.float32)
 
         kept_perm = sorted_perm[keep_sorted]
         if kept_perm.numel() > 0:
@@ -869,6 +816,11 @@ class MoCTopKExperts(nn.Module):
                 if self.experts[e].last_step_penalty is not None:
                     reasoning_penalty = reasoning_penalty + (
                         self.experts[e].last_step_penalty.to(reasoning_penalty.dtype)
+                        * (float(chunk_size) / total_kept)
+                    )
+                if self.experts[e].last_gate_entropy_loss is not None:
+                    gate_entropy_loss_sum = gate_entropy_loss_sum + (
+                        self.experts[e].last_gate_entropy_loss.to(gate_entropy_loss_sum.dtype)
                         * (float(chunk_size) / total_kept)
                     )
 
@@ -904,7 +856,7 @@ class MoCTopKExperts(nn.Module):
                 no_kept=no_kept,
             )
 
-        aux_loss = aux_loss + reasoning_penalty + collab_penalty
+        aux_loss = aux_loss + reasoning_penalty + collab_penalty + gate_entropy_loss_sum
 
         fused = self.o_proj(fused).view(bsz, seqlen, d_model)
         expert_indices = topk_idx.view(bsz, seqlen, self.top_k).to(torch.long)
@@ -921,10 +873,8 @@ class MoCTopKExperts(nn.Module):
                 "router_entropy": router_entropy.detach(),
                 "avg_reasoning_steps": avg_reasoning_steps.detach(),
                 "avg_collab_steps": avg_collab_steps.detach(),
-                # FIX 3 diagnostic: tells you whether this layer ran collaboration.
-                "collab_active_this_layer": torch.tensor(
-                    float(self.use_moc_collab_this_layer), device=x.device
-                ).detach(),
+                "gate_entropy_loss": gate_entropy_loss_sum.detach(),
+                "gate_entropy_beta": torch.tensor(self.gate_entropy_beta, device=x.device).detach(),
             }
         else:
             self.last_routing_diagnostics = None
@@ -934,21 +884,18 @@ class MoCTopKExperts(nn.Module):
 
 # -----------------------------------------------------------------------------
 # Transformer block
-# FIX 3: Block now accepts and forwards layer_idx to MoCTopKExperts.
 # -----------------------------------------------------------------------------
 class Block(nn.Module):
-    def __init__(self, config: LunarisCodexConfig, layer_idx: int = 0):
+    def __init__(self, config: LunarisCodexConfig):
         super().__init__()
         self.config = config
-        self.layer_idx = layer_idx
 
         self.attn_norm = RMSNorm(config.d_model, eps=1e-6)
         self.attention = Attention(config)
         self.ffn_norm = RMSNorm(config.d_model, eps=1e-6)
 
         if config.n_experts is not None and config.n_experts > 0 and config.top_k >= 1:
-            # FIX 3: pass layer_idx so MoCTopKExperts knows whether to collaborate.
-            self.feed_forward = MoCTopKExperts(config, layer_idx=layer_idx)
+            self.feed_forward = MoCTopKExperts(config)
             self.is_moe = True
         else:
             self.feed_forward = ReasoningFeedForward(config)
@@ -985,6 +932,7 @@ class Block(nn.Module):
 
         if self.training and self.config.use_gradient_checkpointing:
             if self.config.grad_ckpt_policy == "block":
+                # Keep checkpoint inputs tensor-only; close over past_kv.
                 def _inner_ckpt(x_inner: torch.Tensor, freqs_cis_inner: torch.Tensor):
                     return _inner_full(x_inner, freqs_cis_inner, past_kv)
 
@@ -1016,7 +964,6 @@ class Block(nn.Module):
 
 # -----------------------------------------------------------------------------
 # Top-level model
-# FIX 3: Blocks are constructed with their layer index.
 # -----------------------------------------------------------------------------
 class LunarisCodex(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
@@ -1026,8 +973,7 @@ class LunarisCodex(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.d_model),
-                # FIX 3: pass layer_idx=i so each Block/MoCTopKExperts knows its depth.
-                h=nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layers)]),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
                 ln_f=RMSNorm(config.d_model, eps=1e-6),
                 drop=nn.Dropout(config.dropout),
             )
@@ -1053,11 +999,40 @@ class LunarisCodex(nn.Module):
         print(f"Number of parameters: {num_params / 1e6:.2f}M")
         if config.n_experts is not None and config.n_experts > 0:
             print("Note: Parameter count includes all experts. Only top_k experts are active per token.")
-        # FIX 3: report which layers will run collaboration.
-        if config.collab_layers is not None:
-            print(f"MoC collaboration active on layers: {sorted(config.collab_layers)}")
-            skipped = [i for i in range(config.n_layers) if i not in config.collab_layers]
-            print(f"MoC collaboration SKIPPED on layers: {skipped} (plain MoE weighted-sum)")
+
+    def set_gate_entropy_beta(self, beta: float) -> None:
+        """Update entropy regularization coefficient across all adaptive gates (Ouro beta scheduling)."""
+        self.config.gate_entropy_beta = beta
+        for block in self.transformer.h:
+            ff = block.feed_forward
+            if hasattr(ff, "gate_entropy_beta"):
+                ff.gate_entropy_beta = beta
+            # Update experts inside MoE layers
+            if hasattr(ff, "experts"):
+                for expert in ff.experts:
+                    if hasattr(expert, "gate_entropy_beta"):
+                        expert.gate_entropy_beta = beta
+
+    def freeze_for_stage2(self) -> int:
+        """Ouro Stage II: freeze all parameters except adaptive gate parameters.
+
+        Returns the number of trainable gate parameters.
+        """
+        gate_keywords = {"step_gate", "collab_step_gate"}
+        gate_param_count = 0
+
+        for name, param in self.named_parameters():
+            is_gate = any(kw in name for kw in gate_keywords)
+            param.requires_grad = is_gate
+            if is_gate:
+                gate_param_count += param.numel()
+
+        return gate_param_count
+
+    def unfreeze_all(self) -> None:
+        """Restore all parameters to trainable (undo Stage II freeze)."""
+        for param in self.parameters():
+            param.requires_grad = True
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -1076,6 +1051,7 @@ class LunarisCodex(nn.Module):
             for block in self.transformer.h:
                 block.attention.o_proj.weight.mul_(1.0 / denom)
                 if block.is_moe:
+                    # MoC path already includes expert projections; only rescale final fused output.
                     block.feed_forward.o_proj.weight.mul_(1.0 / denom)
                 else:
                     block.feed_forward.w2.weight.mul_(1.0 / denom)
@@ -1157,6 +1133,7 @@ class LunarisCodex(nn.Module):
             else:
                 nodecay_params.append(p)
 
+        # Keep compatibility with naming expectations.
         for n, p in self.named_parameters():
             if n.endswith("feed_forward.gate.weight") and id(p) not in router_param_ids:
                 router_params.append(p)
@@ -1239,60 +1216,11 @@ def compile_model_if_available(model: nn.Module, mode: str = "max-autotune"):
 
 
 if __name__ == "__main__":
+    # Minimal shape sanity (torch must be available in runtime environment)
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # -------------------------------------------------------------------------
-    # Sanity A: original config — backward-compatible (collab_layers=None)
-    # -------------------------------------------------------------------------
-    cfg_original = LunarisCodexConfig(
-        d_model=64,
-        n_layers=2,
-        n_heads=4,
-        n_kv_heads=4,
-        vocab_size=503,
-        multiple_of=16,
-        ffn_hidden_multiplier=4.0,
-        max_seq_len=64,
-        dropout=0.0,
-        n_experts=4,
-        top_k=2,
-        aux_loss_weight=1e-2,
-        capacity_factor=1.25,
-        router_z_loss_weight=1e-3,
-        router_noise_std=0.02,
-        drop_penalty_weight=1e-3,
-        use_gradient_checkpointing=True,
-        grad_ckpt_policy="ffn",
-        use_simple_collab=False,
-        use_moc_collab=True,
-        moc_collab_steps=2,
-        moc_use_mediator=True,
-        n_reasoning_steps=3,        # FIX 2: 3 steps → 3 distinct step embeddings
-        adaptive_reasoning=True,
-        adaptive_collaboration=True,
-        adaptive_compute_mode="soft",
-        return_routing_diagnostics=True,
-        collab_layers=None,         # None → all layers collab (backward compat)
-    )
-
-    model_a = LunarisCodex(cfg_original).to(device)
-
-    bsz, seqlen = 2, 8
-    idx = torch.randint(0, cfg_original.vocab_size, (bsz, seqlen), device=device)
-    targets = torch.randint(0, cfg_original.vocab_size, (bsz, seqlen), device=device)
-
-    model_a.train()
-    logits, loss_tuple, _, debug = model_a(idx, targets=targets)
-    total_loss, ce_loss, aux_loss = loss_tuple
-    print(f"\n[A] all-layers collab | Losses → total: {total_loss.item():.4f}, "
-          f"ce: {ce_loss.item():.4f}, aux: {aux_loss.item():.6f}")
-    assert logits.shape == (bsz, seqlen, cfg_original.vocab_size)
-
-    # -------------------------------------------------------------------------
-    # Sanity B: FIX 3 active — only layers [1] collaborate (layer 0 skipped)
-    # -------------------------------------------------------------------------
-    cfg_selective = LunarisCodexConfig(
+    cfg = LunarisCodexConfig(
         d_model=64,
         n_layers=2,
         n_heads=4,
@@ -1320,28 +1248,22 @@ if __name__ == "__main__":
         adaptive_collaboration=True,
         adaptive_compute_mode="soft",
         return_routing_diagnostics=True,
-        collab_layers=[1],          # FIX 3: only layer 1 collaborates
     )
 
-    model_b = LunarisCodex(cfg_selective).to(device)
-    model_b.train()
-    logits_b, loss_tuple_b, _, debug_b = model_b(idx, targets=targets)
-    total_b, ce_b, aux_b = loss_tuple_b
-    print(f"[B] selective collab  | Losses → total: {total_b.item():.4f}, "
-          f"ce: {ce_b.item():.4f}, aux: {aux_b.item():.6f}")
-    assert logits_b.shape == (bsz, seqlen, cfg_selective.vocab_size)
+    model = LunarisCodex(cfg).to(device)
 
-    # Verify collab_active_this_layer diagnostic is correct per layer.
-    if debug_b and debug_b.get("routing_diagnostics"):
-        for layer_i, diag in enumerate(debug_b["routing_diagnostics"]):
-            active = bool(diag.get("collab_active_this_layer", torch.tensor(0.0)).item())
-            expected = layer_i in cfg_selective.collab_layers
-            assert active == expected, f"Layer {layer_i}: expected collab={expected}, got {active}"
-        print("collab_active_this_layer diagnostics: OK")
+    bsz, seqlen = 2, 8
+    idx = torch.randint(0, cfg.vocab_size, (bsz, seqlen), device=device)
+    targets = torch.randint(0, cfg.vocab_size, (bsz, seqlen), device=device)
 
-    # Generate sanity
-    model_b.eval()
-    out = model_b.generate(idx[:, :4], max_new_tokens=5)
-    assert out.shape[1] == 9
-    print("Generate shape:", out.shape)
-    print("\nSanity complete. Both fixes verified.")
+    model.train()
+    logits, loss_tuple, _, debug = model(idx, targets=targets)
+    total_loss, ce_loss, aux_loss = loss_tuple
+    print(f"Losses -> total: {total_loss.tolist():.4f}, ce: {ce_loss.tolist():.4f}, aux: {aux_loss.tolist():.6f}")
+    print("Debug keys:", None if debug is None else list(debug.keys()))
+    assert logits.shape == (bsz, seqlen, cfg.vocab_size)
+
+    model.eval()
+    out = model.generate(idx[:, :4], max_new_tokens=5)
+    print("Generate output shape:", out.shape)
+    print("Sanity complete.")
