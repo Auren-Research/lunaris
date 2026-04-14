@@ -68,6 +68,18 @@ class TrainConfig:
     rich_terminal: bool = True
     save_best: bool = True
 
+    # Ouro-style entropy regularization scheduling
+    gate_entropy_beta: float = 0.1
+    gate_entropy_beta_final: float = 0.05
+    gate_entropy_beta_warmup_frac: float = 0.1  # hold initial beta for this fraction of training
+
+    # Stage II: freeze LM, train only adaptive gates with loss-improvement signal
+    stage2_enabled: bool = False
+    stage2_start_step: int = 0  # step at which Stage II begins (0 = manual via separate run)
+    stage2_lr: float = 1e-4
+    stage2_gamma_threshold: float = 0.005  # Ouro gamma for ideal exit label
+    stage2_slope: float = 50.0  # Ouro sigmoid slope k
+
     @property
     def sequence_length(self) -> int:
         """Alias used by dataset setup."""
@@ -186,6 +198,26 @@ def get_lr(step: int, config: TrainConfig) -> float:
     ratio = (step - config.warmup_steps) / max(1, (config.max_steps - config.warmup_steps))
     coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
     return (config.learning_rate * 0.01) + coeff * (config.learning_rate * 0.99)
+
+
+def get_gate_entropy_beta(step: int, config: TrainConfig) -> float:
+    """Ouro-style beta scheduling: hold initial beta, then linearly decay to final.
+
+    - For the first `gate_entropy_beta_warmup_frac` of training, keep beta high
+      to encourage exploration across gate depths.
+    - Then linearly decay to beta_final so the gate can sharpen its decisions.
+    """
+    beta_init = float(config.gate_entropy_beta)
+    beta_final = float(config.gate_entropy_beta_final)
+    warmup_end = int(config.max_steps * config.gate_entropy_beta_warmup_frac)
+
+    if step <= warmup_end:
+        return beta_init
+    if step >= config.max_steps:
+        return beta_final
+
+    ratio = (step - warmup_end) / max(1, config.max_steps - warmup_end)
+    return beta_init + ratio * (beta_final - beta_init)
 
 
 def unwrap_model_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -380,6 +412,7 @@ def init_routing_entry(diag: Dict[str, Any]) -> Dict[str, Any]:
         "capacity_sum": 0.0,
         "reasoning_sum": 0.0,
         "collab_sum": 0.0,
+        "gate_entropy_loss_sum": 0.0,
         "count": 0,
     }
 
@@ -415,6 +448,7 @@ def update_routing_window(
             entry["capacity_sum"] += to_float(diag.get("capacity_per_expert", 0.0))
             entry["reasoning_sum"] += to_float(diag.get("avg_reasoning_steps", 0.0))
             entry["collab_sum"] += to_float(diag.get("avg_collab_steps", 0.0))
+            entry["gate_entropy_loss_sum"] += to_float(diag.get("gate_entropy_loss", 0.0))
             entry["count"] += 1
 
             reasoning_samples.append(to_float(diag.get("avg_reasoning_steps", 0.0)))
@@ -483,6 +517,7 @@ def summarize_routing(
             "capacity_per_expert": float(entry["capacity_sum"] / count),
             "avg_reasoning_steps": float(entry["reasoning_sum"] / count),
             "avg_collab_steps": float(entry["collab_sum"] / count),
+            "gate_entropy_loss": float(entry["gate_entropy_loss_sum"] / count),
             "gini": gini,
             "dead_experts": dead_count,
         }
@@ -977,6 +1012,9 @@ def train(config_path: str) -> None:
 
     raw_model = LunarisCodex(config.model).to(device)
 
+    # Sync entropy beta from training config to model
+    raw_model.set_gate_entropy_beta(config.gate_entropy_beta)
+
     active_params, total_params = compute_active_params_per_token(raw_model)
     active_ratio = active_params / max(1, total_params)
     if is_master:
@@ -1102,6 +1140,24 @@ def train(config_path: str) -> None:
 
         lr = get_lr(current_step, config)
         apply_param_group_lrs(optimizer.param_groups, lr)
+
+        # Ouro-style entropy beta scheduling
+        current_beta = get_gate_entropy_beta(current_step, config)
+        raw_model.set_gate_entropy_beta(current_beta)
+
+        # Ouro Stage II: freeze LM, train only adaptive gates with sharpened decisions
+        if (
+            config.stage2_enabled
+            and config.stage2_start_step > 0
+            and current_step == config.stage2_start_step
+        ):
+            gate_params = raw_model.freeze_for_stage2()
+            # Override LR for gate-only training
+            for pg in optimizer.param_groups:
+                if any(p.requires_grad for p in pg["params"]):
+                    pg["lr"] = config.stage2_lr
+            if is_master:
+                print(f"\n[STAGE II] Froze LM params. Training {gate_params:,} gate params at lr={config.stage2_lr:.1e}")
 
         do_log = config.log_interval > 0 and (current_step % config.log_interval == 0)
         step_total_loss_sum.zero_()
@@ -1334,6 +1390,7 @@ def train(config_path: str) -> None:
                     "routing/avg_collab_steps": routing_summary["avg_collab"],
                     "routing/adaptive_compute_efficiency": routing_summary["efficiency"],
                     "routing/compute_saved_pct": routing_summary["efficiency"] * 100.0,
+                    "routing/gate_entropy_beta": current_beta,
                     "meta/active_params_per_token": active_params,
                     "meta/total_trainable_params": total_params,
                     "meta/active_params_ratio": active_ratio,
@@ -1353,6 +1410,7 @@ def train(config_path: str) -> None:
                         log_data[f"routing/layer_{layer_idx}/capacity_per_expert"] = stats["capacity_per_expert"]
                         log_data[f"routing/layer_{layer_idx}/avg_reasoning_steps"] = stats["avg_reasoning_steps"]
                         log_data[f"routing/layer_{layer_idx}/avg_collab_steps"] = stats["avg_collab_steps"]
+                        log_data[f"routing/layer_{layer_idx}/gate_entropy_loss"] = stats["gate_entropy_loss"]
                         log_data[f"routing/gini_layer_{layer_idx}"] = stats["gini"]
                         log_data[f"routing/dead_experts_layer_{layer_idx}"] = stats["dead_experts"]
 
